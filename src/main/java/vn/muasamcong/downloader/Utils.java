@@ -7,6 +7,7 @@ import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
@@ -166,6 +167,26 @@ public final class Utils {
             stats.getFailCount()
         );
         System.out.println(line);
+
+        if (stats.getFailures().isEmpty()) {
+            System.out.println("Failed downloads: 0");
+            return;
+        }
+
+        System.out.println("Failed downloads:");
+        int index = 1;
+        for (RunStats.FailureRecord failure : stats.getFailures()) {
+            String item = String.format(
+                "%d) keyword=\"%s\" | attempts=%d | thread=%d | reason=%s",
+                index,
+                failure.keyword(),
+                failure.attempts(),
+                failure.threadId(),
+                failure.reason()
+            );
+            System.out.println(item);
+            index++;
+        }
     }
 
     private static boolean hasInProgressDownload(Path downloadDir) {
@@ -184,6 +205,26 @@ public final class Utils {
             return waitForDownloadedPdf(downloadDir, filesBeforeClick, timeout);
         } catch (TimeoutException ex) {
             return null;
+        }
+    }
+
+    public static void deleteDirectoryQuietly(Path directory) {
+        if (directory == null || !Files.exists(directory)) {
+            return;
+        }
+
+        try (Stream<Path> paths = Files.walk(directory)) {
+            paths
+                .sorted(Comparator.reverseOrder())
+                .forEach(path -> {
+                    try {
+                        Files.deleteIfExists(path);
+                    } catch (IOException ignored) {
+                        // Best effort cleanup only.
+                    }
+                });
+        } catch (IOException ignored) {
+            // Best effort cleanup only.
         }
     }
 }

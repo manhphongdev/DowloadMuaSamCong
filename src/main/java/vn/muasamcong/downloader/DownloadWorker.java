@@ -6,8 +6,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Queue;
 import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import org.openqa.selenium.By;
 import org.openqa.selenium.NoSuchElementException;
 import org.openqa.selenium.TimeoutException;
@@ -17,7 +15,6 @@ import org.openqa.selenium.WebElement;
 public final class DownloadWorker implements Runnable {
 
     private static final Duration DEFAULT_WAIT = Duration.ofSeconds(25);
-    private static final Pattern PDF_URL_PATTERN = Pattern.compile("https?://[^'\\\"\\s>]+\\.pdf", Pattern.CASE_INSENSITIVE);
 
     private static final By HOME_INPUT = By.cssSelector("main#home input[name='keyword']");
     private static final By HOME_SEARCH_BUTTON = By.cssSelector("main#home button.search-button");
@@ -75,7 +72,7 @@ public final class DownloadWorker implements Runnable {
     public void run() {
         WebDriver driver = null;
         long threadId = Thread.currentThread().threadId();
-        Path threadDownloadDir = baseDownloadDir.resolve(String.valueOf(threadId));
+        Path threadDownloadDir = baseDownloadDir.resolve("_thread_tmp_" + threadId);
 
         int maxAttempts = maxRetries + 1;
 
@@ -89,11 +86,13 @@ public final class DownloadWorker implements Runnable {
                 }
 
                 boolean success = false;
+                String lastErrorMessage = "Unknown error";
                 Utils.logStatus(keyword, "START", 0, "Begin processing keyword.");
 
                 for (int attempt = 1; attempt <= maxAttempts; attempt++) {
                     try {
                         SeleniumHelper.closeExtraWindows(driver);
+                        SeleniumHelper.normalizeWindows(driver, url -> url.toLowerCase().contains("muasamcong.mpi.gov.vn"));
                         performDownloadFlow(driver, threadDownloadDir, keyword);
 
                         Utils.logStatus(keyword, "SUCCESS", attempt, "Downloaded and saved to keyword folder.");
@@ -101,14 +100,14 @@ public final class DownloadWorker implements Runnable {
                         success = true;
                         break;
                     } catch (Exception ex) {
-                        Utils.logStatus(keyword, "FAIL", attempt, rootMessage(ex));
-                        if (attempt == maxAttempts) {
-                            stats.markFail();
-                        }
+                        lastErrorMessage = rootMessage(ex);
+                        Utils.logStatus(keyword, "FAIL", attempt, lastErrorMessage);
                     }
                 }
 
                 if (!success) {
+                    stats.markFail();
+                    stats.addFailure(keyword, maxAttempts, lastErrorMessage, Thread.currentThread().threadId());
                     Utils.logStatus(keyword, "FAIL", maxAttempts, "Exceeded retry limit, moving to next keyword.");
                 } else {
                     Utils.logStatus(keyword, "DONE", maxAttempts, "Finished keyword.");
@@ -118,11 +117,13 @@ public final class DownloadWorker implements Runnable {
             if (driver != null) {
                 driver.quit();
             }
+            Utils.deleteDirectoryQuietly(threadDownloadDir);
         }
     }
 
     private void performDownloadFlow(WebDriver driver, Path downloadDir, String keyword) {
         SeleniumHelper.openUrlRobust(driver, baseUrl, DEFAULT_WAIT);
+        SeleniumHelper.normalizeWindows(driver, url -> url.toLowerCase().contains("muasamcong.mpi.gov.vn"));
         Utils.logStatus(keyword, "INFO", 0, "Opened URL: " + driver.getCurrentUrl());
         SeleniumHelper.dismissPopupIfPresent(driver);
 
@@ -146,13 +147,21 @@ public final class DownloadWorker implements Runnable {
         SeleniumHelper.waitVisible(driver, RESULT_ITEM, DEFAULT_WAIT);
         SeleniumHelper.safeClick(driver, FIRST_DETAIL_LINK, DEFAULT_WAIT);
         SeleniumHelper.switchToNewestWindowIfNeeded(driver, Duration.ofSeconds(3));
+        SeleniumHelper.normalizeWindows(driver, url -> url.toLowerCase().contains("render=detail-v2"));
+
+        if (SeleniumHelper.isDisposableCurrentUrl(driver) || !SeleniumHelper.isRelevantCurrentUrl(driver)) {
+            throw new IllegalStateException("Unexpected page after opening detail: " + driver.getCurrentUrl());
+        }
 
         SeleniumHelper.dismissPopupIfPresent(driver);
         WebElement attachment = findDecisionAttachment(driver);
 
         Set<Path> before = Utils.snapshotPdfFiles(downloadDir);
-        if (!tryNavigateByDirectPdfUrl(driver, attachment, keyword)) {
-            SeleniumHelper.safeClick(driver, attachment);
+        SeleniumHelper.safeClick(driver, attachment);
+        SeleniumHelper.normalizeWindows(driver, url -> url.toLowerCase().contains("render=detail-v2"));
+
+        if (SeleniumHelper.isDisposableCurrentUrl(driver)) {
+            throw new IllegalStateException("Browser navigated to disposable URL after clicking download: " + driver.getCurrentUrl());
         }
 
         Path downloaded = Utils.safeWaitForPdf(downloadDir, before, downloadTimeout);
@@ -191,36 +200,5 @@ public final class DownloadWorker implements Runnable {
         }
         String message = root.getMessage();
         return (message == null || message.isBlank()) ? root.getClass().getSimpleName() : message;
-    }
-
-    private boolean tryNavigateByDirectPdfUrl(WebDriver driver, WebElement attachment, String keywordValue) {
-        String[] attrs = new String[] {"href", "data-href", "data-url", "src", "onclick"};
-        for (String attr : attrs) {
-            String raw = attachment.getDomAttribute(attr);
-            String pdfUrl = extractPdfUrl(raw);
-            if (pdfUrl != null) {
-                Utils.logStatus(keywordValue, "INFO", 0, "Downloading via direct PDF URL.");
-                driver.get(pdfUrl);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private String extractPdfUrl(String raw) {
-        if (raw == null || raw.isBlank()) {
-            return null;
-        }
-
-        String trimmed = raw.trim();
-        if (trimmed.startsWith("http") && trimmed.toLowerCase().contains(".pdf")) {
-            return trimmed;
-        }
-
-        Matcher matcher = PDF_URL_PATTERN.matcher(trimmed);
-        if (matcher.find()) {
-            return matcher.group();
-        }
-        return null;
     }
 }

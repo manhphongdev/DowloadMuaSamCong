@@ -8,6 +8,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import org.openqa.selenium.By;
 import org.openqa.selenium.ElementClickInterceptedException;
 import org.openqa.selenium.JavascriptExecutor;
@@ -164,6 +165,35 @@ public final class SeleniumHelper {
 
         driver.switchTo().window(currentHandle);
         return false;
+    }
+
+    public static void normalizeWindows(WebDriver driver, Predicate<String> preferredUrl) {
+        String original = driver.getWindowHandle();
+        String fallbackHandle = original;
+
+        for (String handle : driver.getWindowHandles()) {
+            driver.switchTo().window(handle);
+            String url = safeCurrentUrl(driver);
+
+            if (isDisposableWindow(url) && driver.getWindowHandles().size() > 1) {
+                driver.close();
+                continue;
+            }
+
+            if (preferredUrl != null && preferredUrl.test(url)) {
+                fallbackHandle = handle;
+            }
+        }
+
+        driver.switchTo().window(fallbackHandle);
+    }
+
+    public static boolean isDisposableCurrentUrl(WebDriver driver) {
+        return isDisposableWindow(safeCurrentUrl(driver));
+    }
+
+    public static boolean isRelevantCurrentUrl(WebDriver driver) {
+        return isRelevantMuasamcongUrl(safeCurrentUrl(driver));
     }
 
     public static void closeExtraWindows(WebDriver driver) {
