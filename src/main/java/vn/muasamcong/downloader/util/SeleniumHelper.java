@@ -1,13 +1,15 @@
-package vn.muasamcong.downloader;
+package vn.muasamcong.downloader.util;
 
 import io.github.bonigarcia.wdm.WebDriverManager;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
 import org.openqa.selenium.By;
 import org.openqa.selenium.ElementClickInterceptedException;
@@ -22,6 +24,9 @@ import org.openqa.selenium.support.ui.ExpectedConditions;
 import org.openqa.selenium.support.ui.WebDriverWait;
 
 public final class SeleniumHelper {
+
+    private static final Set<WebDriver> MANAGED_DRIVERS =
+        Collections.newSetFromMap(new ConcurrentHashMap<WebDriver, Boolean>());
 
     private SeleniumHelper() {
     }
@@ -51,7 +56,36 @@ public final class SeleniumHelper {
         options.addArguments("--no-default-browser-check");
         options.addArguments("--remote-allow-origins=*");
 
-        return new ChromeDriver(options);
+        WebDriver driver = new ChromeDriver(options);
+        MANAGED_DRIVERS.add(driver);
+        return driver;
+    }
+
+    public static void quitDriverQuietly(WebDriver driver) {
+        if (driver == null) {
+            return;
+        }
+        boolean interrupted = Thread.currentThread().isInterrupted();
+        try {
+            if (interrupted) {
+                Thread.interrupted();
+            }
+            driver.quit();
+        } catch (Exception ignored) {
+            // best effort quit only
+        } finally {
+            MANAGED_DRIVERS.remove(driver);
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    public static void quitAllDriversNow() {
+        List<WebDriver> snapshot = new ArrayList<>(MANAGED_DRIVERS);
+        for (WebDriver driver : snapshot) {
+            quitDriverQuietly(driver);
+        }
     }
 
     public static void openUrlRobust(WebDriver driver, String url, Duration timeout) {
@@ -168,24 +202,50 @@ public final class SeleniumHelper {
     }
 
     public static void normalizeWindows(WebDriver driver, Predicate<String> preferredUrl) {
-        String original = driver.getWindowHandle();
-        String fallbackHandle = original;
+        Set<String> handles = driver.getWindowHandles();
+        if (handles.isEmpty()) {
+            return;
+        }
 
-        for (String handle : driver.getWindowHandles()) {
+        String original = driver.getWindowHandle();
+        String preferredHandle = null;
+        String relevantHandle = null;
+        String nonDisposableHandle = null;
+
+        for (String handle : handles) {
             driver.switchTo().window(handle);
             String url = safeCurrentUrl(driver);
 
-            if (isDisposableWindow(url) && driver.getWindowHandles().size() > 1) {
-                driver.close();
-                continue;
-            }
-
             if (preferredUrl != null && preferredUrl.test(url)) {
-                fallbackHandle = handle;
+                preferredHandle = handle;
+            }
+            if (relevantHandle == null && isRelevantMuasamcongUrl(url)) {
+                relevantHandle = handle;
+            }
+            if (nonDisposableHandle == null && !isDisposableWindow(url)) {
+                nonDisposableHandle = handle;
             }
         }
 
-        driver.switchTo().window(fallbackHandle);
+        String keepHandle = preferredHandle != null
+            ? preferredHandle
+            : (relevantHandle != null ? relevantHandle : (nonDisposableHandle != null ? nonDisposableHandle : original));
+
+        for (String handle : new ArrayList<>(driver.getWindowHandles())) {
+            if (handle.equals(keepHandle)) {
+                continue;
+            }
+            driver.switchTo().window(handle);
+            String url = safeCurrentUrl(driver);
+            if (isDisposableWindow(url)) {
+                driver.close();
+            }
+        }
+
+        if (!driver.getWindowHandles().contains(keepHandle)) {
+            keepHandle = driver.getWindowHandles().iterator().next();
+        }
+        driver.switchTo().window(keepHandle);
     }
 
     public static boolean isDisposableCurrentUrl(WebDriver driver) {
@@ -197,14 +257,35 @@ public final class SeleniumHelper {
     }
 
     public static void closeExtraWindows(WebDriver driver) {
-        String mainHandle = driver.getWindowHandle();
-        for (String handle : driver.getWindowHandles()) {
-            if (!handle.equals(mainHandle)) {
+        Set<String> handles = driver.getWindowHandles();
+        if (handles.isEmpty()) {
+            return;
+        }
+
+        String current = driver.getWindowHandle();
+        String keepHandle = current;
+        String currentUrl = safeCurrentUrl(driver);
+        if (isDisposableWindow(currentUrl)) {
+            for (String handle : handles) {
+                driver.switchTo().window(handle);
+                if (!isDisposableWindow(safeCurrentUrl(driver))) {
+                    keepHandle = handle;
+                    break;
+                }
+            }
+        }
+
+        for (String handle : new ArrayList<>(driver.getWindowHandles())) {
+            if (!handle.equals(keepHandle)) {
                 driver.switchTo().window(handle);
                 driver.close();
             }
         }
-        driver.switchTo().window(mainHandle);
+
+        if (!driver.getWindowHandles().contains(keepHandle)) {
+            keepHandle = driver.getWindowHandles().iterator().next();
+        }
+        driver.switchTo().window(keepHandle);
     }
 
     private static String safeCurrentUrl(WebDriver driver) {

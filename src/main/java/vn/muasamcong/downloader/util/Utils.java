@@ -1,4 +1,6 @@
-package vn.muasamcong.downloader;
+package vn.muasamcong.downloader.util;
+
+import vn.muasamcong.downloader.core.RunStats;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -11,15 +13,22 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.openqa.selenium.TimeoutException;
 import org.openqa.selenium.support.ui.FluentWait;
 import org.openqa.selenium.support.ui.Wait;
 
 public final class Utils {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(Utils.class);
     private static final DateTimeFormatter TS_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final AtomicReference<Consumer<String>> LOG_SINK = new AtomicReference<>();
+    private static final Path DATA_DIR = resolveDataDirectory();
 
     private Utils() {
     }
@@ -36,7 +45,23 @@ public final class Utils {
             status,
             message
         );
-        System.out.println(line);
+        logPlain(line);
+    }
+
+    public static void setLogSink(Consumer<String> sink) {
+        LOG_SINK.set(sink);
+    }
+
+    public static void clearLogSink() {
+        LOG_SINK.set(null);
+    }
+
+    public static void logPlain(String line) {
+        LOGGER.info(line);
+        Consumer<String> sink = LOG_SINK.get();
+        if (sink != null) {
+            sink.accept(line);
+        }
     }
 
     public static Set<Path> snapshotPdfFiles(Path downloadDir) {
@@ -98,28 +123,20 @@ public final class Utils {
         }
     }
 
-    public static Path movePdfToKeywordFolder(Path sourcePdf, Path baseDownloadDir, String keyword) {
+    public static Path movePdfToTargetFolder(Path sourcePdf, Path targetFolder) {
         if (sourcePdf == null || !Files.exists(sourcePdf)) {
             throw new IllegalArgumentException("Source PDF is missing.");
         }
 
-        String safeKeyword = sanitizeFileName(keyword);
-        Path keywordDir = baseDownloadDir.resolve(safeKeyword);
-        ensureDirectory(keywordDir);
+        ensureDirectory(targetFolder);
 
-        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
-        Path target = keywordDir.resolve(safeKeyword + "_" + timestamp + ".pdf");
-        int suffix = 1;
-
-        while (Files.exists(target)) {
-            target = keywordDir.resolve(safeKeyword + "_" + timestamp + "_" + suffix + ".pdf");
-            suffix++;
-        }
+        String fileName = sourcePdf.getFileName().toString();
+        Path target = targetFolder.resolve(fileName);
 
         try {
             return Files.move(sourcePdf, target, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException ex) {
-            throw new RuntimeException("Unable to move PDF to keyword folder.", ex);
+            throw new RuntimeException("Unable to move PDF to target folder.", ex);
         }
     }
 
@@ -151,12 +168,31 @@ public final class Utils {
         return safe.length() > 80 ? safe.substring(0, 80) : safe;
     }
 
+    private static String buildSuffixedFileName(String fileName, int suffix) {
+        int dotIndex = fileName.lastIndexOf('.');
+        if (dotIndex <= 0) {
+            return fileName + "_" + suffix;
+        }
+
+        String baseName = fileName.substring(0, dotIndex);
+        String extension = fileName.substring(dotIndex);
+        return baseName + "_" + suffix + extension;
+    }
+
     public static void ensureDirectory(Path path) {
         try {
             Files.createDirectories(path);
         } catch (IOException ex) {
             throw new RuntimeException("Unable to create directory: " + path.toAbsolutePath(), ex);
         }
+    }
+
+    public static Path dataDirectory() {
+        return DATA_DIR;
+    }
+
+    public static Path dataFile(String fileName) {
+        return DATA_DIR.resolve(fileName);
     }
 
     public static void logFinalStats(RunStats stats) {
@@ -166,14 +202,14 @@ public final class Utils {
             stats.getSuccessCount(),
             stats.getFailCount()
         );
-        System.out.println(line);
+        logPlain(line);
 
         if (stats.getFailures().isEmpty()) {
-            System.out.println("Failed downloads: 0");
+            logPlain("Failed downloads: 0");
             return;
         }
 
-        System.out.println("Failed downloads:");
+        logPlain("Failed downloads:");
         int index = 1;
         for (RunStats.FailureRecord failure : stats.getFailures()) {
             String item = String.format(
@@ -184,7 +220,7 @@ public final class Utils {
                 failure.threadId(),
                 failure.reason()
             );
-            System.out.println(item);
+            logPlain(item);
             index++;
         }
     }
@@ -226,5 +262,24 @@ public final class Utils {
         } catch (IOException ignored) {
             // Best effort cleanup only.
         }
+    }
+
+    private static Path resolveDataDirectory() {
+        String envDataDir = System.getenv("MUASAMCONG_DATA_DIR");
+        if (envDataDir != null && !envDataDir.isBlank()) {
+            return Path.of(envDataDir).toAbsolutePath().normalize();
+        }
+
+        Path workingDirData = Path.of("data").toAbsolutePath().normalize();
+        if (Files.exists(workingDirData)) {
+            return workingDirData;
+        }
+
+        Path packagedContentData = Path.of("content", "data").toAbsolutePath().normalize();
+        if (Files.exists(packagedContentData)) {
+            return packagedContentData;
+        }
+
+        return workingDirData;
     }
 }

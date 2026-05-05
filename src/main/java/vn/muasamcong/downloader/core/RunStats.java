@@ -1,4 +1,4 @@
-package vn.muasamcong.downloader;
+package vn.muasamcong.downloader.core;
 
 import java.util.List;
 import java.util.Queue;
@@ -11,12 +11,14 @@ public final class RunStats {
     private final AtomicInteger successCount;
     private final AtomicInteger failCount;
     private final Queue<FailureRecord> failures;
+    private final Queue<ProcessedRecord> processedRecords;
 
     public RunStats(int totalKeywords) {
         this.totalKeywords = totalKeywords;
         this.successCount = new AtomicInteger();
         this.failCount = new AtomicInteger();
         this.failures = new ConcurrentLinkedQueue<>();
+        this.processedRecords = new ConcurrentLinkedQueue<>();
     }
 
     public int getTotalKeywords() {
@@ -47,6 +49,26 @@ public final class RunStats {
         return List.copyOf(failures);
     }
 
+    public void addProcessedRecord(ProcessedRecord record) {
+        if (record != null) {
+            processedRecords.add(record);
+        }
+    }
+
+    public List<ProcessedRecord> getProcessedRecords() {
+        return List.copyOf(processedRecords);
+    }
+
     public record FailureRecord(String keyword, int attempts, String reason, long threadId) {
+    }
+
+    public record ProcessedRecord(
+        String keyword,
+        String folderPath,
+        String status,
+        int attempts,
+        String error,
+        int downloadedFilesCount
+    ) {
     }
 }

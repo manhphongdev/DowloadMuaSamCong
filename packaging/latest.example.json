@@ -1,0 +1,11 @@
+{
+  "version": "1.0.1",
+  "releaseDate": "2026-05-05",
+  "downloadUrl": "https://github.com/your-org/muasamcong/releases/download/v1.0.1/MuaSamCong-1.0.1.zip",
+  "fileName": "MuaSamCong-1.0.1.zip",
+  "notes": [
+    "Fix loi hien thi link dieu huong trong sheet MucLuc",
+    "Cai thien giao dien Settings",
+    "Them co che kiem tra va tai ban cap nhat"
+  ]
+}

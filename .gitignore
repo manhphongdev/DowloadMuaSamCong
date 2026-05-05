@@ -31,3 +31,16 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Local runtime data ###
+data/
+!data/.gitkeep
+logs/
+updates/
+cache/
+
+### Secrets / env ###
+.env
+*.key
+*.pem
+*credentials*.json
