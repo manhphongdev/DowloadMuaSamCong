@@ -6,7 +6,7 @@
 
     <groupId>vn.muasamcong</groupId>
     <artifactId>pdf-downloader</artifactId>
-    <version>1.0.2</version>
+    <version>1.0.3</version>
     <name>muasamcong-pdf-downloader</name>
 
     <properties>
