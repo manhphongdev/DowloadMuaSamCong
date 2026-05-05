@@ -20,6 +20,7 @@ public final class UpdateService {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(15))
+        .followRedirects(HttpClient.Redirect.NORMAL)
         .build();
     private static final Path UPDATE_DIR = Path.of("updates").toAbsolutePath().normalize();
 
