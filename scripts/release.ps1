@@ -26,6 +26,16 @@ $zipName = "MuaSamCong-Downloader-$Version-win.zip"
 $zipPath = Join-Path $distDir $zipName
 $latestOutPath = Join-Path $projectRoot "packaging\latest.generated.json"
 
+function Write-Utf8NoBom {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Content
+    )
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+
 function Replace-FileContent {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -43,8 +53,7 @@ function Replace-FileContent {
         return $false
     }
 
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $new, $utf8NoBom)
+    Write-Utf8NoBom -Path $Path -Content $new
     return $true
 }
 
@@ -139,7 +148,7 @@ if ($GenerateLatestJson) {
         notes = @("Update release $Version")
     } | ConvertTo-Json -Depth 4
 
-    Set-Content -Path $latestOutPath -Value $json -Encoding UTF8
+    Write-Utf8NoBom -Path $latestOutPath -Content $json
     Write-Host "Created: $latestOutPath"
 }
 else {
