@@ -1,9 +1,9 @@
 {
     "releaseDate":  "2026-05-06",
-    "fileName":  "MuaSamCong-Downloader-1.0.15-win.zip",
-    "version":  "1.0.15",
-    "downloadUrl":  "https://github.com/manhphongdev/DowloadMuaSamCong/releases/download/v1.0.15/MuaSamCong-Downloader-1.0.15-win.zip",
+    "fileName":  "MuaSamCong-Downloader-1.0.16-win.zip",
+    "version":  "1.0.16",
+    "downloadUrl":  "https://github.com/manhphongdev/DowloadMuaSamCong/releases/download/v1.0.16/MuaSamCong-Downloader-1.0.16-win.zip",
     "notes":  [
-                  "Update release 1.0.15"
+                  "Update release 1.0.16"
               ]
 }
