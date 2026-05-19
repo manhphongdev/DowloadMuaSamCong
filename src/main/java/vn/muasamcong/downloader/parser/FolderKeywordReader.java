@@ -4,17 +4,19 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import vn.muasamcong.downloader.model.KeywordTarget;
 
 public final class FolderKeywordReader {
 
-    private FolderKeywordReader() {
-    }
+    private static final Pattern KEYWORD_PATTERN = Pattern.compile("^\\s*\\d+\\s*\\.\\s*(IB[A-Za-z0-9]+)(?=\\.|\\s|$)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern FOLDER_ORDER_PATTERN = Pattern.compile("^\\s*(\\d+)\\s*\\.");
 
-    public static List<KeywordTarget> readKeywords(Path rootFolder) {
-        return readKeywords(List.of(rootFolder));
+    private FolderKeywordReader() {
     }
 
     public static List<KeywordTarget> readKeywords(List<Path> rootFolders) {
@@ -49,21 +51,65 @@ public final class FolderKeywordReader {
             }
         }
 
+        targets.sort(Comparator
+            .comparing(
+                FolderKeywordReader::parentFolderName,
+                Comparator.nullsLast(String::compareToIgnoreCase)
+            )
+            .thenComparing(
+                FolderKeywordReader::folderOrder,
+                Comparator.nullsLast(Integer::compareTo)
+            )
+            .thenComparing(
+                FolderKeywordReader::folderName,
+                Comparator.nullsLast(String::compareToIgnoreCase)
+            ));
         return targets;
     }
 
     static String extractKeyword(String folderName) {
-        int firstDot = folderName.indexOf('.');
-        if (firstDot < 0) {
+        if (folderName == null || folderName.isBlank()) {
             return "";
         }
 
-        int secondDot = folderName.indexOf('.', firstDot + 1);
-        if (secondDot < 0 || secondDot <= firstDot + 1) {
+        Matcher matcher = KEYWORD_PATTERN.matcher(folderName);
+        if (!matcher.find()) {
             return "";
         }
 
-        String rawKeyword = folderName.substring(firstDot + 1, secondDot);
-        return rawKeyword.replaceAll("\\s+", "").trim();
+        return matcher.group(1).toUpperCase();
+    }
+
+    private static Integer folderOrder(KeywordTarget target) {
+        String folderName = folderName(target);
+        if (folderName == null) {
+            return null;
+        }
+
+        Matcher matcher = FOLDER_ORDER_PATTERN.matcher(folderName);
+        if (!matcher.find()) {
+            return null;
+        }
+
+        try {
+            return Integer.parseInt(matcher.group(1));
+        } catch (NumberFormatException ex) {
+            return null;
+        }
+    }
+
+    private static String parentFolderName(KeywordTarget target) {
+        if (target == null || target.folderPath() == null || target.folderPath().getParent() == null
+            || target.folderPath().getParent().getFileName() == null) {
+            return null;
+        }
+        return target.folderPath().getParent().getFileName().toString();
+    }
+
+    private static String folderName(KeywordTarget target) {
+        if (target == null || target.folderPath() == null || target.folderPath().getFileName() == null) {
+            return null;
+        }
+        return target.folderPath().getFileName().toString();
     }
 }

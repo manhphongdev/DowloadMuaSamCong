@@ -23,6 +23,8 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import vn.muasamcong.downloader.model.BidSheetRow;
 import vn.muasamcong.downloader.model.BidSheetRowBuilder;
 import vn.muasamcong.downloader.model.BidStatus;
@@ -35,9 +37,10 @@ public final class GoogleSheetsSyncService {
     private static final String INDEX_SHEET_NAME = "MucLuc";
     private static final String DATA_RANGE_START_A1 = "A1";
     private static final String INDEX_DATA_RANGE_START_A1 = "A1";
-    private static final int STATUS_COLUMN_INDEX = 5; // column F, zero-based
-    private static final int REMAINING_COLUMN_INDEX = 7; // column H, zero-based
-    private static final int TOTAL_COLUMN_COUNT = 9; // A..I
+    private static final Pattern FOLDER_ORDER_PATTERN = Pattern.compile("^\\s*(\\d+)\\s*\\.");
+    private static final int STATUS_COLUMN_INDEX = 7; // column H, zero-based
+    private static final int REMAINING_COLUMN_INDEX = 9; // column J, zero-based
+    private static final int TOTAL_COLUMN_COUNT = 11; // A..K
     private static final DateTimeFormatter INDEX_TIME_FORMAT = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
     private static final List<String> OUTPUT_HEADERS = List.of(
         "Số TBMT",
@@ -45,6 +48,8 @@ public final class GoogleSheetsSyncService {
         "CĐT",
         "Thư mục THHD",
         "Dự toán",
+        "Ngày đăng tải",
+        "Thời gian thực hiện gói thầu",
         "Trạng thái",
         "Thời điểm đóng thầu",
         "Còn lại",
@@ -75,7 +80,7 @@ public final class GoogleSheetsSyncService {
             int rowCount = syncFromJson(jsonFile, config);
             Utils.logPlain("Google Sheets sync completed. Rows: " + rowCount);
         } catch (Exception ex) {
-            Utils.logPlain("Google Sheets sync failed: " + ex.getMessage());
+            Utils.logPlain("Google Sheets sync failed: " + summarizeError(ex));
         }
     }
 
@@ -139,6 +144,16 @@ public final class GoogleSheetsSyncService {
             }
         }
 
+        LocalDateTime postedDate = null;
+        String postedDateRaw = textValue(node, "postedDate");
+        if (postedDateRaw != null && !postedDateRaw.isBlank()) {
+            try {
+                postedDate = LocalDateTime.parse(postedDateRaw);
+            } catch (Exception ignored) {
+                postedDate = null;
+            }
+        }
+
         Duration remaining = null;
         JsonNode remainingNode = node.get("remainingTimeSeconds");
         if (remainingNode != null && remainingNode.isNumber()) {
@@ -152,10 +167,13 @@ public final class GoogleSheetsSyncService {
             .contractPerformanceFolder(textValue(node, "contractPerformanceFolder"))
             .parentFolderName(textValue(node, "parentFolderName"))
             .estimatedBudget(parseEstimatedBudget(node.get("estimatedBudget")))
+            .postedDate(postedDate)
+            .packageExecutionTime(textValue(node, "packageExecutionTime"))
             .status(status)
             .bidClosingTime(bidClosingTime)
             .remainingTimeToClosing(remaining)
             .folderLink(textValue(node, "folderLink"))
+            .tenderLink(textValue(node, "tenderLink"))
             .build();
     }
 
@@ -380,12 +398,52 @@ public final class GoogleSheetsSyncService {
         int rowCount,
         List<SheetOverview> sheetOverviews
     ) throws Exception {
-        Integer sheetId = resolveSheetId(spreadsheetId, INDEX_SHEET_NAME, accessToken);
-        if (sheetId == null) {
+        JsonNode root = readSpreadsheetMetadata(
+            spreadsheetId,
+            "sheets(properties(sheetId,title),bandedRanges(bandedRangeId,range))",
+            accessToken
+        );
+
+        Integer sheetId = null;
+        JsonNode targetSheet = null;
+        JsonNode sheets = root == null ? null : root.get("sheets");
+        if (sheets == null || !sheets.isArray()) {
+            return;
+        }
+        for (JsonNode sheet : sheets) {
+            String title = sheet.path("properties").path("title").asText("").trim();
+            if (INDEX_SHEET_NAME.equals(title)) {
+                sheetId = sheet.path("properties").path("sheetId").asInt();
+                targetSheet = sheet;
+                break;
+            }
+        }
+        if (sheetId == null || targetSheet == null) {
             return;
         }
 
         List<Map<String, Object>> requests = new ArrayList<>();
+        JsonNode bandedRanges = targetSheet.get("bandedRanges");
+        if (bandedRanges != null && bandedRanges.isArray()) {
+            for (JsonNode bandedRange : bandedRanges) {
+                JsonNode range = bandedRange.get("range");
+                if (range == null || range.isMissingNode()) {
+                    continue;
+                }
+                int startColumn = range.path("startColumnIndex").asInt(0);
+                int endColumn = range.path("endColumnIndex").asInt(0);
+                int startRow = range.path("startRowIndex").asInt(0);
+                if (startRow == 0 && startColumn == 0 && endColumn == 6) {
+                    int bandedRangeId = bandedRange.path("bandedRangeId").asInt(-1);
+                    if (bandedRangeId > 0) {
+                        requests.add(Map.of(
+                            "deleteBanding", Map.of("bandedRangeId", bandedRangeId)
+                        ));
+                    }
+                }
+            }
+        }
+
         requests.add(Map.of(
             "updateSheetProperties", Map.of(
                 "properties", Map.of(
@@ -797,9 +855,8 @@ public final class GoogleSheetsSyncService {
                     continue;
                 }
                 int startColumn = range.path("startColumnIndex").asInt(0);
-                int endColumn = range.path("endColumnIndex").asInt(0);
                 int startRow = range.path("startRowIndex").asInt(0);
-                if (startRow == 0 && startColumn == 0 && endColumn == TOTAL_COLUMN_COUNT) {
+                if (startRow == 0 && startColumn == 0) {
                     int bandedRangeId = bandedRange.path("bandedRangeId").asInt(-1);
                     if (bandedRangeId > 0) {
                         requests.add(Map.of(
@@ -876,6 +933,28 @@ public final class GoogleSheetsSyncService {
         ));
 
         requests.add(Map.of(
+            "repeatCell", Map.of(
+                "range", Map.of(
+                    "sheetId", sheetId,
+                    "startRowIndex", 1,
+                    "endRowIndex", dataRowEnd,
+                    "startColumnIndex", 4,
+                    "endColumnIndex", 5
+                ),
+                "cell", Map.of(
+                    "userEnteredFormat", Map.of(
+                        "numberFormat", Map.of(
+                            "type", "CURRENCY",
+                            "pattern", "#,##0 \"đ\""
+                        ),
+                        "horizontalAlignment", "RIGHT"
+                    )
+                ),
+                "fields", "userEnteredFormat(numberFormat,horizontalAlignment)"
+            )
+        ));
+
+        requests.add(Map.of(
             "addBanding", Map.of(
                 "bandedRange", Map.of(
                     "range", Map.of(
@@ -918,9 +997,11 @@ public final class GoogleSheetsSyncService {
         requests.add(columnWidthRequest(sheetId, 3, 260));
         requests.add(columnWidthRequest(sheetId, 4, 150));
         requests.add(columnWidthRequest(sheetId, 5, 220));
-        requests.add(columnWidthRequest(sheetId, 6, 180));
+        requests.add(columnWidthRequest(sheetId, 6, 240));
         requests.add(columnWidthRequest(sheetId, 7, 180));
-        requests.add(columnWidthRequest(sheetId, 8, 420));
+        requests.add(columnWidthRequest(sheetId, 8, 180));
+        requests.add(columnWidthRequest(sheetId, 9, 180));
+        requests.add(columnWidthRequest(sheetId, 10, 420));
 
         String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + ":batchUpdate";
         String payload = OBJECT_MAPPER.writeValueAsString(Map.of("requests", requests));
@@ -1241,7 +1322,7 @@ public final class GoogleSheetsSyncService {
         throws Exception {
         List<BidSheetRow> sortedRows = sortRows(rows);
         String sheetPrefix = toSheetA1Prefix(sheetName);
-        updateSingleRange(spreadsheetId, sheetPrefix + "!" + DATA_RANGE_START_A1, buildValues(sortedRows), accessToken, "RAW");
+        updateSingleRange(spreadsheetId, sheetPrefix + "!" + DATA_RANGE_START_A1, buildValues(sortedRows), accessToken, "USER_ENTERED");
     }
 
     private static void updateSingleRange(
@@ -1290,14 +1371,20 @@ public final class GoogleSheetsSyncService {
             return;
         }
         String body = response.body() == null ? "" : response.body();
+        String apiMessage = extractApiMessage(body);
         throw new IllegalStateException("Google Sheets API failed to " + action
-            + " (HTTP " + statusCode + "): " + body);
+            + " (HTTP " + statusCode + ")"
+            + (apiMessage == null || apiMessage.isBlank() ? "" : ": " + apiMessage));
     }
 
     private static List<BidSheetRow> sortRows(List<BidSheetRow> rows) {
         List<BidSheetRow> sortedRows = new ArrayList<>(rows);
         sortedRows.sort(Comparator
             .comparing(
+                GoogleSheetsSyncService::folderOrder,
+                Comparator.nullsLast(Integer::compareTo)
+            )
+            .thenComparing(
                 (BidSheetRow row) -> normalizeForSort(row.contractPerformanceFolder()),
                 Comparator.nullsLast(String::compareToIgnoreCase)
             )
@@ -1308,16 +1395,36 @@ public final class GoogleSheetsSyncService {
         return sortedRows;
     }
 
+    private static Integer folderOrder(BidSheetRow row) {
+        String folderName = normalizeForSort(row == null ? null : row.contractPerformanceFolder());
+        if (folderName == null) {
+            return null;
+        }
+
+        Matcher matcher = FOLDER_ORDER_PATTERN.matcher(folderName);
+        if (!matcher.find()) {
+            return null;
+        }
+
+        try {
+            return Integer.parseInt(matcher.group(1));
+        } catch (NumberFormatException ex) {
+            return null;
+        }
+    }
+
     private static List<List<Object>> buildValues(List<BidSheetRow> sortedRows) {
         List<List<Object>> values = new ArrayList<>();
         values.add(new ArrayList<>(OUTPUT_HEADERS));
         for (BidSheetRow row : sortedRows) {
             values.add(List.of(
-                safeText(row.tmbtNumber()),
+                safeText(buildTmbtCellValue(row.tmbtNumber(), row.tenderLink())),
                 safeText(row.packageName()),
                 safeText(row.procuringEntity()),
                 safeText(row.contractPerformanceFolder()),
-                safeText(formatEstimatedBudget(row.estimatedBudget())),
+                estimatedBudgetValue(row.estimatedBudget()),
+                safeText(formatDateTime(row.postedDate())),
+                safeText(row.packageExecutionTime()),
                 safeText(toStatusLabel(row.status())),
                 safeText(formatDateTime(row.bidClosingTime())),
                 safeText(formatRemaining(row.remainingTimeToClosing())),
@@ -1325,6 +1432,48 @@ public final class GoogleSheetsSyncService {
             ));
         }
         return values;
+    }
+
+    private static String buildTmbtCellValue(String tmbtNumber, String tenderLink) {
+        String tmbt = safeText(tmbtNumber).trim();
+        if (tmbt.isEmpty()) {
+            return "";
+        }
+        String resolvedLink = tenderLink == null || tenderLink.isBlank()
+            ? "https://muasamcong.mpi.gov.vn/web/guest/contractor-selection?keyword=" + urlEncode(tmbt)
+            : tenderLink.trim();
+        String escapedUrl = resolvedLink.replace("\"", "\"\"");
+        String escapedLabel = tmbt.replace("\"", "\"\"");
+        return "=HYPERLINK(\"" + escapedUrl + "\";\"" + escapedLabel + "\")";
+    }
+
+    private static String extractApiMessage(String body) {
+        if (body == null || body.isBlank()) {
+            return "";
+        }
+        try {
+            JsonNode root = OBJECT_MAPPER.readTree(body);
+            JsonNode messageNode = root.path("error").path("message");
+            if (messageNode.isTextual()) {
+                String message = messageNode.asText();
+                return message == null ? "" : message.replaceAll("\\s+", " ").trim();
+            }
+        } catch (Exception ignored) {
+            // keep best effort fallback below
+        }
+        return body.replaceAll("\\s+", " ").trim();
+    }
+
+    private static String summarizeError(Throwable throwable) {
+        if (throwable == null) {
+            return "Unknown";
+        }
+        String message = throwable.getMessage();
+        if (message == null || message.isBlank()) {
+            return throwable.getClass().getSimpleName();
+        }
+        String oneLine = message.replaceAll("\\s+", " ").trim();
+        return oneLine.length() > 300 ? oneLine.substring(0, 300) + "..." : oneLine;
     }
 
     private static String safeText(String value) {
@@ -1339,21 +1488,8 @@ public final class GoogleSheetsSyncService {
         return trimmed.isEmpty() ? null : trimmed;
     }
 
-    private static String formatEstimatedBudget(BigInteger value) {
-        if (value == null) {
-            return "";
-        }
-        String digits = value.toString();
-        StringBuilder sb = new StringBuilder(digits.length() + (digits.length() / 3));
-        int first = digits.length() % 3;
-        if (first == 0) {
-            first = 3;
-        }
-        sb.append(digits, 0, first);
-        for (int i = first; i < digits.length(); i += 3) {
-            sb.append('.').append(digits, i, i + 3);
-        }
-        return sb.toString();
+    private static Object estimatedBudgetValue(BigInteger value) {
+        return value == null ? "" : value;
     }
 
     private static String toStatusLabel(BidStatus status) {

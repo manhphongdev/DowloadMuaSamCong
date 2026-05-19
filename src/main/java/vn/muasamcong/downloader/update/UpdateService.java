@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.BiConsumer;
 import vn.muasamcong.downloader.util.Utils;
 
 public final class UpdateService {
@@ -22,7 +23,7 @@ public final class UpdateService {
         .connectTimeout(Duration.ofSeconds(15))
         .followRedirects(HttpClient.Redirect.NORMAL)
         .build();
-    private static final Path UPDATE_DIR = Path.of("updates").toAbsolutePath().normalize();
+    private static final Path UPDATE_DIR = Utils.dataDirectory().resolve("updates").toAbsolutePath().normalize();
 
     private UpdateService() {
     }
@@ -54,6 +55,10 @@ public final class UpdateService {
     }
 
     public static Path downloadUpdate(UpdateInfo info) throws Exception {
+        return downloadUpdate(info, null);
+    }
+
+    public static Path downloadUpdate(UpdateInfo info, BiConsumer<Long, Long> progressListener) throws Exception {
         if (info == null || info.downloadUrl() == null || info.downloadUrl().isBlank()) {
             throw new IllegalArgumentException("Download URL is required.");
         }
@@ -69,9 +74,24 @@ public final class UpdateService {
             .build();
         HttpResponse<InputStream> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofInputStream());
         ensureOk(response.statusCode(), "", "download update");
+        long totalBytes = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
 
         try (InputStream in = response.body()) {
-            Files.copy(in, temp, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            byte[] buffer = new byte[64 * 1024];
+            long downloaded = 0L;
+            try (java.io.OutputStream out = Files.newOutputStream(temp)) {
+                int read;
+                while ((read = in.read(buffer)) >= 0) {
+                    if (read == 0) {
+                        continue;
+                    }
+                    out.write(buffer, 0, read);
+                    downloaded += read;
+                    if (progressListener != null) {
+                        progressListener.accept(downloaded, totalBytes);
+                    }
+                }
+            }
         }
         Files.move(temp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         return target;

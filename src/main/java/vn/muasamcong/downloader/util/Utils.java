@@ -26,7 +26,6 @@ import org.openqa.selenium.support.ui.Wait;
 public final class Utils {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(Utils.class);
-    private static final DateTimeFormatter TS_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final AtomicReference<Consumer<String>> LOG_SINK = new AtomicReference<>();
     private static final Path DATA_DIR = resolveDataDirectory();
 
@@ -34,26 +33,11 @@ public final class Utils {
     }
 
     public static void logStatus(String keyword, String status, int attempt, String message) {
-        long threadId = Thread.currentThread().threadId();
-        String timestamp = LocalDateTime.now().format(TS_FORMAT);
-        String line = String.format(
-            "%s | thread=%d | keyword=\"%s\" | attempt=%d | status=%s | %s",
-            timestamp,
-            threadId,
-            keyword,
-            attempt,
-            status,
-            message
-        );
+        String safeKeyword = keyword == null || keyword.isBlank() ? "-" : keyword.trim();
+        String safeStatus = status == null || status.isBlank() ? "INFO" : status.trim().toUpperCase();
+        String safeMessage = message == null ? "" : message.trim();
+        String line = safeKeyword + " " + safeStatus + (safeMessage.isEmpty() ? "" : " " + safeMessage);
         logPlain(line);
-    }
-
-    public static void setLogSink(Consumer<String> sink) {
-        LOG_SINK.set(sink);
-    }
-
-    public static void clearLogSink() {
-        LOG_SINK.set(null);
     }
 
     public static void logPlain(String line) {
@@ -64,12 +48,32 @@ public final class Utils {
         }
     }
 
+    public static void setLogSink(Consumer<String> sink) {
+        LOG_SINK.set(sink);
+    }
+
+    public static void clearLogSink() {
+        LOG_SINK.set(null);
+    }
+
     public static Set<Path> snapshotPdfFiles(Path downloadDir) {
         ensureDirectory(downloadDir);
         try (Stream<Path> files = Files.list(downloadDir)) {
             return files
                 .filter(Files::isRegularFile)
                 .filter(path -> path.getFileName().toString().toLowerCase().endsWith(".pdf"))
+                .collect(Collectors.toCollection(HashSet::new));
+        } catch (IOException ex) {
+            throw new RuntimeException("Unable to list download directory: " + downloadDir.toAbsolutePath(), ex);
+        }
+    }
+
+    public static Set<Path> snapshotCompletedFiles(Path downloadDir) {
+        ensureDirectory(downloadDir);
+        try (Stream<Path> files = Files.list(downloadDir)) {
+            return files
+                .filter(Files::isRegularFile)
+                .filter(path -> !isInProgressFileName(path.getFileName().toString()))
                 .collect(Collectors.toCollection(HashSet::new));
         } catch (IOException ex) {
             throw new RuntimeException("Unable to list download directory: " + downloadDir.toAbsolutePath(), ex);
@@ -95,6 +99,37 @@ public final class Utils {
 
             return current.stream()
                 .filter(Utils::isNonEmptyPdf)
+                .findFirst()
+                .orElse(null);
+        });
+    }
+
+    public static Path waitForDownloadedFile(
+        Path downloadDir,
+        Set<Path> filesBeforeClick,
+        Duration timeout,
+        Set<String> allowedExtensions
+    ) {
+        Wait<Path> wait = new FluentWait<>(downloadDir)
+            .withTimeout(timeout)
+            .pollingEvery(Duration.ofMillis(500))
+            .ignoring(RuntimeException.class);
+
+        Set<String> normalizedExtensions = normalizeExtensions(allowedExtensions);
+        return wait.until(path -> {
+            if (hasInProgressDownload(path)) {
+                return null;
+            }
+
+            Set<Path> current = snapshotCompletedFiles(path);
+            current.removeAll(filesBeforeClick == null ? Set.of() : filesBeforeClick);
+            if (current.isEmpty()) {
+                return null;
+            }
+
+            return current.stream()
+                .filter(file -> hasAllowedExtension(file, normalizedExtensions))
+                .filter(Utils::isNonEmptyRegularFile)
                 .findFirst()
                 .orElse(null);
         });
@@ -140,11 +175,62 @@ public final class Utils {
         }
     }
 
+    public static Path moveFileToTargetFolder(Path sourceFile, Path targetFolder) {
+        if (sourceFile == null || !Files.exists(sourceFile)) {
+            throw new IllegalArgumentException("Source file is missing.");
+        }
+
+        ensureDirectory(targetFolder);
+
+        String fileName = sourceFile.getFileName().toString();
+        Path target = targetFolder.resolve(fileName);
+
+        try {
+            return Files.move(sourceFile, target, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException ex) {
+            throw new RuntimeException("Unable to move downloaded file to target folder.", ex);
+        }
+    }
+
+    public static Path moveFileToTargetFolderUnique(Path sourceFile, Path targetFolder) {
+        if (sourceFile == null || !Files.exists(sourceFile)) {
+            throw new IllegalArgumentException("Source file is missing.");
+        }
+
+        ensureDirectory(targetFolder);
+
+        String fileName = sourceFile.getFileName().toString();
+        Path target = targetFolder.resolve(fileName);
+        int suffix = 1;
+        while (Files.exists(target)) {
+            target = targetFolder.resolve(buildSuffixedFileName(fileName, suffix));
+            suffix++;
+        }
+
+        try {
+            return Files.move(sourceFile, target);
+        } catch (IOException ex) {
+            throw new RuntimeException("Unable to move downloaded file to target folder.", ex);
+        }
+    }
+
     public static boolean isNonEmptyPdf(Path file) {
         if (file == null || !Files.exists(file) || !Files.isRegularFile(file)) {
             return false;
         }
         if (!file.getFileName().toString().toLowerCase().endsWith(".pdf")) {
+            return false;
+        }
+
+        try {
+            return Files.size(file) > 0;
+        } catch (IOException ex) {
+            return false;
+        }
+    }
+
+    public static boolean isNonEmptyRegularFile(Path file) {
+        if (file == null || !Files.exists(file) || !Files.isRegularFile(file)) {
             return false;
         }
 
@@ -213,11 +299,10 @@ public final class Utils {
         int index = 1;
         for (RunStats.FailureRecord failure : stats.getFailures()) {
             String item = String.format(
-                "%d) keyword=\"%s\" | attempts=%d | thread=%d | reason=%s",
+                "%d) keyword=\"%s\" | attempts=%d | reason=%s",
                 index,
                 failure.keyword(),
                 failure.attempts(),
-                failure.threadId(),
                 failure.reason()
             );
             logPlain(item);
@@ -230,15 +315,114 @@ public final class Utils {
             return files
                 .filter(Files::isRegularFile)
                 .map(path -> path.getFileName().toString().toLowerCase())
-                .anyMatch(name -> name.endsWith(".crdownload") || name.endsWith(".tmp") || name.endsWith(".part"));
+                .anyMatch(Utils::isInProgressFileName);
         } catch (IOException ex) {
             return false;
         }
     }
 
+    private static boolean isInProgressFileName(String fileName) {
+        String name = fileName == null ? "" : fileName.toLowerCase();
+        return name.endsWith(".crdownload") || name.endsWith(".tmp") || name.endsWith(".part");
+    }
+
+    private static Set<String> normalizeExtensions(Set<String> extensions) {
+        if (extensions == null || extensions.isEmpty()) {
+            return Set.of();
+        }
+        return extensions.stream()
+            .filter(Objects::nonNull)
+            .map(String::trim)
+            .filter(value -> !value.isBlank())
+            .map(value -> value.startsWith(".") ? value.toLowerCase() : "." + value.toLowerCase())
+            .collect(Collectors.toSet());
+    }
+
+    private static boolean hasAllowedExtension(Path file, Set<String> allowedExtensions) {
+        if (allowedExtensions == null || allowedExtensions.isEmpty()) {
+            return true;
+        }
+        String fileName = file == null || file.getFileName() == null
+            ? ""
+            : file.getFileName().toString().toLowerCase();
+        return allowedExtensions.stream().anyMatch(fileName::endsWith);
+    }
+
     public static Path safeWaitForPdf(Path downloadDir, Set<Path> filesBeforeClick, Duration timeout) {
         try {
             return waitForDownloadedPdf(downloadDir, filesBeforeClick, timeout);
+        } catch (TimeoutException ex) {
+            return null;
+        }
+    }
+
+    public static Path findLatestNonEmptyPdfSince(Path downloadDir, long minLastModifiedMillis) {
+        ensureDirectory(downloadDir);
+        try (Stream<Path> files = Files.list(downloadDir)) {
+            return files
+                .filter(Files::isRegularFile)
+                .filter(file -> file.getFileName().toString().toLowerCase().endsWith(".pdf"))
+                .filter(Utils::isNonEmptyPdf)
+                .filter(file -> {
+                    try {
+                        return Files.getLastModifiedTime(file).toMillis() >= minLastModifiedMillis;
+                    } catch (IOException ignored) {
+                        return false;
+                    }
+                })
+                .max(Comparator.comparingLong(file -> {
+                    try {
+                        return Files.getLastModifiedTime(file).toMillis();
+                    } catch (IOException ignored) {
+                        return Long.MIN_VALUE;
+                    }
+                }))
+                .orElse(null);
+        } catch (IOException ex) {
+            return null;
+        }
+    }
+
+    public static Path findLatestNonEmptyFileSince(
+        Path downloadDir,
+        long minLastModifiedMillis,
+        Set<String> allowedExtensions
+    ) {
+        ensureDirectory(downloadDir);
+        Set<String> normalizedExtensions = normalizeExtensions(allowedExtensions);
+        try (Stream<Path> files = Files.list(downloadDir)) {
+            return files
+                .filter(Files::isRegularFile)
+                .filter(file -> hasAllowedExtension(file, normalizedExtensions))
+                .filter(Utils::isNonEmptyRegularFile)
+                .filter(file -> {
+                    try {
+                        return Files.getLastModifiedTime(file).toMillis() >= minLastModifiedMillis;
+                    } catch (IOException ignored) {
+                        return false;
+                    }
+                })
+                .max(Comparator.comparingLong(file -> {
+                    try {
+                        return Files.getLastModifiedTime(file).toMillis();
+                    } catch (IOException ignored) {
+                        return Long.MIN_VALUE;
+                    }
+                }))
+                .orElse(null);
+        } catch (IOException ex) {
+            return null;
+        }
+    }
+
+    public static Path safeWaitForDownloadedFile(
+        Path downloadDir,
+        Set<Path> filesBeforeClick,
+        Duration timeout,
+        Set<String> allowedExtensions
+    ) {
+        try {
+            return waitForDownloadedFile(downloadDir, filesBeforeClick, timeout, allowedExtensions);
         } catch (TimeoutException ex) {
             return null;
         }
@@ -271,15 +455,51 @@ public final class Utils {
         }
 
         Path workingDirData = Path.of("data").toAbsolutePath().normalize();
+        Path packagedContentData = Path.of("content", "data").toAbsolutePath().normalize();
+
+        String appData = System.getenv("APPDATA");
+        if (appData != null && !appData.isBlank()) {
+            Path stableDataDir = Path.of(appData, "MuaSamCongDownloader", "data").toAbsolutePath().normalize();
+            migrateDirectoryIfNeeded(workingDirData, stableDataDir);
+            migrateDirectoryIfNeeded(packagedContentData, stableDataDir);
+            return stableDataDir;
+        }
+
         if (Files.exists(workingDirData)) {
             return workingDirData;
         }
 
-        Path packagedContentData = Path.of("content", "data").toAbsolutePath().normalize();
         if (Files.exists(packagedContentData)) {
             return packagedContentData;
         }
 
         return workingDirData;
+    }
+
+    private static void migrateDirectoryIfNeeded(Path from, Path to) {
+        if (from == null || to == null || from.equals(to) || !Files.exists(from) || !Files.isDirectory(from)) {
+            return;
+        }
+
+        try {
+            Files.createDirectories(to);
+            try (Stream<Path> paths = Files.walk(from)) {
+                paths.forEach(source -> {
+                    try {
+                        Path relative = from.relativize(source);
+                        Path target = to.resolve(relative);
+                        if (Files.isDirectory(source)) {
+                            Files.createDirectories(target);
+                        } else if (!Files.exists(target)) {
+                            Files.copy(source, target, StandardCopyOption.COPY_ATTRIBUTES);
+                        }
+                    } catch (IOException ignored) {
+                        // Best effort migration only.
+                    }
+                });
+            }
+        } catch (IOException ignored) {
+            // Best effort migration only.
+        }
     }
 }

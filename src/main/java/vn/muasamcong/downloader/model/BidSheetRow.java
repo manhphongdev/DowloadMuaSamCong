@@ -12,10 +12,13 @@ public record BidSheetRow(
     String contractPerformanceFolder, // thu muc thhd
     String parentFolderName, // folder cha
     BigInteger estimatedBudget, // du toan
+    LocalDateTime postedDate,
+    String packageExecutionTime,
     BidStatus status,
     LocalDateTime bidClosingTime,
     Duration remainingTimeToClosing,
-    String folderLink
+    String folderLink,
+    String tenderLink
 ) {
 
     public static List<String> headers() {
@@ -26,10 +29,13 @@ public record BidSheetRow(
             "Contract Performance Folder",
             "Parent Folder Name",
             "Estimated Budget",
+            "Posted Date",
+            "Package Execution Time",
             "Status",
             "Bid Closing Time",
             "Remaining Time To Closing",
-            "Folder Link"
+            "Folder Link",
+            "Tender Link"
         );
     }
 }

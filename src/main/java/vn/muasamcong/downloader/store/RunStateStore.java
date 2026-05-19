@@ -224,7 +224,10 @@ public final class RunStateStore {
     private static String escape(String value) {
         return value
             .replace("\\", "\\\\")
-            .replace("\"", "\\\"");
+            .replace("\"", "\\\"")
+            .replace("\r", "\\r")
+            .replace("\n", "\\n")
+            .replace("\t", "\\t");
     }
 
     private static String text(JsonNode node, String field) {

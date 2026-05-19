@@ -7,7 +7,9 @@ param(
     [switch]$SkipVersionBump,
     [switch]$SkipBuild,
     [switch]$SkipZip,
-    [switch]$GenerateLatestJson
+    [switch]$GenerateLatestJson,
+    [switch]$Publish,
+    [string]$ReleaseNotes = ""
 )
 
 Set-StrictMode -Version Latest
@@ -25,6 +27,7 @@ $appFolder = Join-Path $distDir "MuaSamCong Downloader"
 $zipName = "MuaSamCong-Downloader-$Version-win.zip"
 $zipPath = Join-Path $distDir $zipName
 $latestOutPath = Join-Path $projectRoot "packaging\latest.generated.json"
+$latestPath = Join-Path $projectRoot "packaging\latest.json"
 
 function Write-Utf8NoBom {
     param(
@@ -153,6 +156,54 @@ if ($GenerateLatestJson) {
 }
 else {
     Write-Host "[4/4] Skip latest json generation"
+}
+
+if ($Publish) {
+    Write-Host "[5/5] Publishing release..."
+    if (-not $Repo) {
+        throw "-Publish requires -Repo (example: manhphongdev/DowloadMuaSamCong)"
+    }
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        throw "gh CLI not found. Install GitHub CLI first."
+    }
+    if (-not (Test-Path $zipPath)) {
+        throw "Zip file not found: $zipPath"
+    }
+
+    if ($GenerateLatestJson) {
+        Copy-Item -Path $latestOutPath -Destination $latestPath -Force
+    }
+
+    $pathsToAdd = @($pomPath, $appInfoPath)
+    if ($GenerateLatestJson -and (Test-Path $latestPath)) {
+        $pathsToAdd += $latestPath
+    }
+
+    & git add -- $pathsToAdd
+    if ($LASTEXITCODE -ne 0) {
+        throw "git add failed"
+    }
+
+    $commitMessage = "chore(release): v$Version"
+    & git diff --cached --quiet
+    if ($LASTEXITCODE -ne 0) {
+        & git commit -m $commitMessage
+        if ($LASTEXITCODE -ne 0) {
+            throw "git commit failed"
+        }
+        & git push
+        if ($LASTEXITCODE -ne 0) {
+            throw "git push failed"
+        }
+    } else {
+        Write-Host "No staged changes to commit. Skipping git commit/push."
+    }
+
+    $notes = if ($ReleaseNotes -and $ReleaseNotes.Trim().Length -gt 0) { $ReleaseNotes } else { "Release v$Version" }
+    & gh release create "v$Version" $zipPath --repo $Repo --title "v$Version" --notes $notes
+    if ($LASTEXITCODE -ne 0) {
+        throw "gh release create failed"
+    }
 }
 
 Write-Host "Done."

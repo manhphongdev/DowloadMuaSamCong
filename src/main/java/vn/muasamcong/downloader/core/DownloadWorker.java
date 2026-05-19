@@ -13,6 +13,9 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeParseException;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -31,6 +34,7 @@ import vn.muasamcong.downloader.util.Utils;
 import org.openqa.selenium.By;
 import org.openqa.selenium.JavascriptExecutor;
 import org.openqa.selenium.NoSuchElementException;
+import org.openqa.selenium.StaleElementReferenceException;
 import org.openqa.selenium.TimeoutException;
 import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.WebElement;
@@ -39,10 +43,16 @@ import org.openqa.selenium.support.ui.WebDriverWait;
 public final class DownloadWorker implements Runnable {
 
     private static final String AUTO_DOWNLOAD_FOLDER_NAME = "auto-download";
+    private static final String HSMT_CLARIFICATION_FOLDER_NAME = "lam-ro-hsmt";
+    private static final String PETITION_FOLDER_NAME = "kien-nghi";
     private static final Duration DEFAULT_WAIT = Duration.ofSeconds(25);
     private static final Duration DOWNLOAD_TIMEOUT = Duration.ofSeconds(60);
     private static final Duration TAB_SWITCH_WAIT = Duration.ofSeconds(6);
     private static final Duration QUICK_LOCATOR_WAIT = Duration.ofSeconds(2);
+    private static final Set<String> EXCEL_EXTENSIONS = Set.of(".xlsx", ".xls", ".xlsm");
+    private static final Set<String> ATTACHMENT_EXTENSIONS = Set.of(
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".zip", ".rar", ".7z"
+    );
     private static final DateTimeFormatter JSON_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss");
     private static final int BID_INFO_SCHEMA_VERSION = 2;
     private static final Path BID_INFO_DATA_DIR = Utils.dataDirectory();
@@ -76,10 +86,27 @@ public final class DownloadWorker implements Runnable {
     private static final List<String> TAB_CONTRACT_INFORMATION_ALIASES = List.of(
         "Thông tin chủ yếu của hợp đồng"
     );
+    private static final By TENDER_INFO_GENERAL_TAB = By.xpath(
+        "//div[@id='tenderNotice']//a[@data-toggle='tab' and contains(@href,'#info-general')]"
+    );
+    private static final By TENDER_INFO_GENERAL_PANE = By.id("info-general");
+    private static final By TENDER_HSMT_CLARIFICATION_TAB = By.xpath(
+        "//div[@id='tenderNotice']//a[@data-toggle='tab' and contains(@href,'#clear-HSMT')]"
+    );
+    private static final By TENDER_HSMT_CLARIFICATION_PANE = By.id("clear-HSMT");
+    private static final By TENDER_PETITION_TAB = By.xpath(
+        "//div[@id='tenderNotice']//a[@data-toggle='tab' and contains(@href,'#kien-nghi')]"
+    );
+    private static final By TENDER_PETITION_PANE = By.id("kien-nghi");
 
     private static final Map<String, List<String>> INFO_LABELS = Map.of(
         "estimatedBudget", List.of(
-            "Dự toán gói thầu"
+            "Dự toán gói thầu",
+            "Dự toán gói thầu được duyệt sau khi phê duyệt KHLCNT"
+        ),
+        "bidClosingTime", List.of(
+            "Thời điểm đóng thầu",
+            "Thời điểm kết thúc chào giá trực tuyến"
     ));
 
     private static final By REMAINING_TIME = By.xpath(
@@ -89,6 +116,10 @@ public final class DownloadWorker implements Runnable {
     );
 
     // ── Detail-page: file đính kèm trong tab BBMT ───────────────────────────
+    private static final By BBMT_INFO_PANE = By.xpath(
+        "//*[@id='bidOpeningMinutes' or @id='bbmtKqm'"
+        + " or contains(@class,'bidOpeningMinutes') or contains(@class,'bbmtKqm')]"
+    );
     private static final By BBMT_DOWNLOAD_ICON_EXACT = By.xpath(
         "//*[(@id='bidOpeningMinutes' or contains(@class,'bidOpeningMinutes') or contains(@class,'bbmtKqm'))]"
         + "//img[@src='/o/egp-portal-contractor-selection-v2/images/icons/download_Outline.svg']"
@@ -115,6 +146,19 @@ public final class DownloadWorker implements Runnable {
         + "//*[contains(@class,'tags-fileAttach')]"
         + "[contains(translate(normalize-space(),'.PDF','.pdf'),'.pdf')]"
     );
+    private static final By KQLCNT_EHSDT_REPORT_PRIMARY = By.xpath(
+        "//div[@id='contractorSelectionResults']"
+        + "//div[contains(@class,'infomation__content')]"
+        + "[.//div[contains(@class,'infomation__content__title')]"
+        + "[contains(normalize-space(),'Báo cáo đánh giá tổng hợp E-HSDT')"
+        + " or contains(normalize-space(),'Bao cao danh gia tong hop E-HSDT')]]"
+        + "//*[contains(@class,'tags-fileAttach')]"
+    );
+    private static final By KQLCNT_WINNING_PRICE_EXCEL_BUTTON = By.xpath(
+        "//div[@id='contractorSelectionResults']"
+        + "//span[contains(normalize-space(),'Bảng giá trúng thầu')]"
+        + "/following::button[contains(normalize-space(),'Xuất Excel')][1]"
+    );
 
     // ────────────────────────────────────────────────────────────────────────
 
@@ -124,6 +168,7 @@ public final class DownloadWorker implements Runnable {
     private final int maxRetries;
     private final RunStats stats;
     private final AtomicBoolean stopRequested;
+    private final int workerSlot;
 
     public DownloadWorker(
         Queue<KeywordTarget> keywordQueue,
@@ -131,7 +176,8 @@ public final class DownloadWorker implements Runnable {
         Path baseDownloadDir,
         int maxRetries,
         RunStats stats,
-        AtomicBoolean stopRequested
+        AtomicBoolean stopRequested,
+        int workerSlot
     ) {
         this.keywordQueue = keywordQueue;
         this.baseUrl = baseUrl;
@@ -139,13 +185,14 @@ public final class DownloadWorker implements Runnable {
         this.maxRetries = maxRetries;
         this.stats = stats;
         this.stopRequested = stopRequested;
+        this.workerSlot = Math.max(1, workerSlot);
     }
 
     public static void prepareBidInfoOutput() {
         synchronized (BID_INFO_JSON_LOCK) {
             Utils.ensureDirectory(BID_INFO_DATA_DIR);
             BID_INFO_ROWS.clear();
-            BID_INFO_ROWS.addAll(loadBidInfoRowsFromDisk());
+            BID_INFO_ROWS.addAll(deduplicateRows(loadBidInfoRowsFromDisk()));
             persistBidInfoRows();
         }
     }
@@ -155,6 +202,35 @@ public final class DownloadWorker implements Runnable {
             Utils.ensureDirectory(BID_INFO_DATA_DIR);
             BID_INFO_ROWS.clear();
             persistBidInfoRows();
+        }
+    }
+
+    public static int removeBidInfoRowsByStateRecords(Collection<RunStateStore.StateRecord> stateRecords) {
+        if (stateRecords == null || stateRecords.isEmpty()) {
+            return 0;
+        }
+        LinkedHashSet<String> keys = new LinkedHashSet<>();
+        for (RunStateStore.StateRecord record : stateRecords) {
+            String key = buildRowKeyFromStateRecord(record);
+            if (key != null && !key.isBlank()) {
+                keys.add(key);
+            }
+        }
+        if (keys.isEmpty()) {
+            return 0;
+        }
+
+        synchronized (BID_INFO_JSON_LOCK) {
+            Utils.ensureDirectory(BID_INFO_DATA_DIR);
+            BID_INFO_ROWS.clear();
+            BID_INFO_ROWS.addAll(deduplicateRows(loadBidInfoRowsFromDisk()));
+            int before = BID_INFO_ROWS.size();
+            BID_INFO_ROWS.removeIf(row -> keys.contains(buildRowKey(row)));
+            int removed = before - BID_INFO_ROWS.size();
+            if (removed > 0) {
+                persistBidInfoRows();
+            }
+            return removed;
         }
     }
 
@@ -201,6 +277,16 @@ public final class DownloadWorker implements Runnable {
             }
         }
 
+        LocalDateTime postedDate = null;
+        String postedDateRaw = textValue(node, "postedDate");
+        if (postedDateRaw != null && !postedDateRaw.isBlank()) {
+            try {
+                postedDate = LocalDateTime.parse(postedDateRaw);
+            } catch (DateTimeParseException ignored) {
+                postedDate = null;
+            }
+        }
+
         Duration remaining = null;
         JsonNode remainingNode = node.get("remainingTimeSeconds");
         if (remainingNode != null && remainingNode.isNumber()) {
@@ -214,10 +300,13 @@ public final class DownloadWorker implements Runnable {
             .contractPerformanceFolder(textValue(node, "contractPerformanceFolder"))
             .parentFolderName(textValue(node, "parentFolderName"))
             .estimatedBudget(parseEstimatedBudgetValue(node.get("estimatedBudget")))
+            .postedDate(postedDate)
+            .packageExecutionTime(textValue(node, "packageExecutionTime"))
             .status(status)
             .bidClosingTime(bidClosingTime)
             .remainingTimeToClosing(remaining)
             .folderLink(textValue(node, "folderLink"))
+            .tenderLink(textValue(node, "tenderLink"))
             .build();
     }
 
@@ -266,12 +355,14 @@ public final class DownloadWorker implements Runnable {
     public void run() {
         WebDriver driver = null;
         boolean completedWithoutStop = false;
-        long threadId = Thread.currentThread().threadId();
-        Path threadDownloadDir = baseDownloadDir.resolve("_thread_tmp_" + threadId);
+        KeywordTarget activeTarget = null;
+        int activeDownloadedFilesCount = 0;
+        Path threadDownloadDir = baseDownloadDir.resolve("_worker_tmp_" + workerSlot);
+        String reusableDriverKey = "download-worker-" + workerSlot;
         int maxAttempts = maxRetries + 1;
 
         try {
-            driver = SeleniumHelper.createDriver(threadDownloadDir);
+            driver = SeleniumHelper.getOrCreateReusableDriver(reusableDriverKey, threadDownloadDir, workerSlot);
 
             while (true) {
                 if (shouldStop()) {
@@ -280,6 +371,8 @@ public final class DownloadWorker implements Runnable {
 
                 KeywordTarget target = keywordQueue.poll();
                 if (target == null) break;
+
+                activeTarget = target;
 
                 String keyword = target.keyword();
                 boolean success = false;
@@ -303,6 +396,7 @@ public final class DownloadWorker implements Runnable {
                         SeleniumHelper.normalizeWindows(driver,
                             url -> url.toLowerCase().contains("muasamcong.mpi.gov.vn"));
                         downloadedFilesCount = performDownloadFlow2(driver, threadDownloadDir, target);
+                        activeDownloadedFilesCount = downloadedFilesCount;
 
                         Utils.logStatus(keyword, "SUCCESS", attempt,
                             "Finished.");
@@ -328,7 +422,7 @@ public final class DownloadWorker implements Runnable {
                         if (isSessionBroken(ex)) {
                             Utils.logStatus(keyword, "WARN", attempt,
                                 "Browser session is broken. Recreating driver for next retry.");
-                            driver = recreateDriver(driver, threadDownloadDir);
+                            driver = recreateDriver(reusableDriverKey, driver, threadDownloadDir);
                         }
                     }
                 }
@@ -364,16 +458,34 @@ public final class DownloadWorker implements Runnable {
                 } else {
                     Utils.logStatus(keyword, "DONE", successAttempt, "Finished keyword.");
                 }
+                activeTarget = null;
+                activeDownloadedFilesCount = 0;
+
             }
             completedWithoutStop = !shouldStop();
-        } catch (CancellationException ignored) {
-            // stop requested by user
+        } catch (CancellationException ex) {
+            if (activeTarget != null) {
+                RunStateStore.markStopped(activeTarget, 0, "Stopped by user", activeDownloadedFilesCount);
+                stats.addProcessedRecord(new RunStats.ProcessedRecord(
+                    activeTarget.keyword(),
+                    activeTarget.folderPath() == null ? null : activeTarget.folderPath().toAbsolutePath().normalize().toString(),
+                    "STOPPED",
+                    0,
+                    "Stopped by user",
+                    activeDownloadedFilesCount
+                ));
+                Utils.logStatus(activeTarget.keyword(), "STOP", 0, "Stopped by user.");
+            }
+        } catch (Throwable ex) {
+            String message = rootMessage(ex);
+            Utils.logPlain("Worker slot " + workerSlot + " stopped before processing keywords: " + message);
         } finally {
             if (completedWithoutStop) {
-                Utils.logPlain("Download cycle completed. Chrome will remain open.");
+                Utils.logPlain("Download cycle completed. Chrome session closed.");
             } else {
-                SeleniumHelper.quitDriverQuietly(driver);
+                Utils.logPlain("Download cycle stopped. Chrome session closed.");
             }
+            SeleniumHelper.discardReusableDriver(reusableDriverKey, driver);
             Utils.deleteDirectoryQuietly(threadDownloadDir);
         }
     }
@@ -382,9 +494,8 @@ public final class DownloadWorker implements Runnable {
         return Thread.currentThread().isInterrupted() || (stopRequested != null && stopRequested.get());
     }
 
-    private WebDriver recreateDriver(WebDriver currentDriver, Path downloadDir) {
-        SeleniumHelper.quitDriverQuietly(currentDriver);
-        return SeleniumHelper.createDriver(downloadDir);
+    private WebDriver recreateDriver(String reusableDriverKey, WebDriver currentDriver, Path downloadDir) {
+        return SeleniumHelper.replaceReusableDriver(reusableDriverKey, currentDriver, downloadDir, workerSlot);
     }
 
     private boolean isSessionBroken(Throwable throwable) {
@@ -393,7 +504,10 @@ public final class DownloadWorker implements Runnable {
             || message.contains("session not created")
             || message.contains("disconnected")
             || message.contains("no such window")
-            || message.contains("chrome not reachable");
+            || message.contains("chrome not reachable")
+            || message.contains("closedchannelexception")
+            || message.contains("connection reset")
+            || message.contains("connection refused");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -414,6 +528,10 @@ public final class DownloadWorker implements Runnable {
         Utils.logStatus(keyword, "INFO", 0,
             "Bid info extracted.");
 
+        int tenderNoticeAttachmentCount = downloadTenderNoticeAttachments(driver, downloadDir, target, keyword);
+        expectedDownloadCount += tenderNoticeAttachmentCount;
+        downloadedCount += tenderNoticeAttachmentCount;
+
         boolean hasBbmtTab = hasTab(driver, TAB_BID_OPENING_MINUTES);
         boolean hasKqlcntTab = hasTab(driver, TAB_CONTRACTOR_SELECTION_RESULTS);
         boolean hasContractInfoTab = hasAnyTab(driver, TAB_CONTRACT_INFORMATION_ALIASES)
@@ -425,8 +543,14 @@ public final class DownloadWorker implements Runnable {
             expectedDownloadCount++;
             Utils.logStatus(keyword, "INFO", 0, "Tab 'Biên bản mở thầu' found -> clicking...");
             clickTab(driver, TAB_BID_OPENING_MINUTES);
+            waitForBbmtInfoReady(driver);
 
-            String budgetFromBbmtRaw = safeReadInfoValueByLabels(driver, INFO_LABELS.get("estimatedBudget"));
+            String budgetFromBbmtRaw = readInfoValueByLabelsFromRenderedDom(
+                driver, BBMT_INFO_PANE, INFO_LABELS.get("estimatedBudget"));
+            Utils.logStatus(keyword, "INFO", 0,
+                "Read Dự toán gói thầu from tab 'Biên bản mở thầu': "
+                + (budgetFromBbmtRaw == null || budgetFromBbmtRaw.isBlank() ? "<empty>" : budgetFromBbmtRaw));
+            logBbmtMoneyFields(driver, keyword);
             BigInteger budgetFromBbmt = parseEstimatedBudget(budgetFromBbmtRaw, keyword);
             if (budgetFromBbmt != null) {
                 bidInfo = BidSheetRowBuilder.from(bidInfo)
@@ -434,6 +558,9 @@ public final class DownloadWorker implements Runnable {
                     .build();
                 Utils.logStatus(keyword, "INFO", 0,
                     "Extracted estimatedBudget from tab 'Biên bản mở thầu': " + formatBudget(budgetFromBbmt));
+            } else {
+                Utils.logStatus(keyword, "INFO", 0,
+                    "Dự toán gói thầu not found in tab 'Biên bản mở thầu'.");
             }
 
             bbmtPdf = downloadBbmtPdf(driver, downloadDir, target, keyword);
@@ -450,6 +577,19 @@ public final class DownloadWorker implements Runnable {
             clickTab(driver, TAB_CONTRACTOR_SELECTION_RESULTS);
             kqlcntPdf = downloadKqlcntDecision(driver, downloadDir, target, keyword);
             downloadedCount++;
+
+            expectedDownloadCount++;
+            downloadKqlcntEhsdtReport(driver, downloadDir, target, keyword);
+            downloadedCount++;
+
+            if (hasVisibleWithWait(driver, KQLCNT_WINNING_PRICE_EXCEL_BUTTON, Duration.ofSeconds(5))) {
+                expectedDownloadCount++;
+                downloadKqlcntWinningPriceExcel(driver, downloadDir, target, keyword);
+                downloadedCount++;
+            } else {
+                Utils.logStatus(keyword, "INFO", 0,
+                    "KQLCNT winning price Excel button not present. Skipping.");
+            }
         } else {
             Utils.logStatus(keyword, "INFO", 0, "Tab 'Kết quả lựa chọn nhà thầu' not present. Skipping.");
         }
@@ -494,6 +634,10 @@ public final class DownloadWorker implements Runnable {
             .build();
 
         exportBidInfoJson(rowToExport, keyword);
+        if (downloadedCount == 0) {
+            Utils.logStatus(keyword, "INFO", 0,
+                "Keyword exported to bid_sheet_rows with 0 downloaded files.");
+        }
         return downloadedCount;
     }
 
@@ -551,11 +695,16 @@ public final class DownloadWorker implements Runnable {
      * Không ném exception — parse lỗi trả về null và log WARN.
      */
     private BidSheetRow extractBidInfo(WebDriver driver, String keyword) {
+        ensureTenderInfoGeneralActive(driver, keyword);
+
         String packageName      = safeReadInfoValue(driver, "Tên gói thầu");
         String procuringEntity  = safeReadInfoValue(driver, "Chủ đầu tư");
-        String bidClosingRaw    = safeReadInfoValue(driver, "Thời điểm đóng thầu");
+        String postedDateRaw    = safeReadInfoValue(driver, "Ngày đăng tải");
+        String executionTime    = safeReadInfoValue(driver, "Thời gian thực hiện gói thầu");
+        String bidClosingRaw    = safeReadInfoValueByLabels(driver, INFO_LABELS.get("bidClosingTime"));
         String remainingRaw     = safeGetRemainingTime(driver);
 
+        LocalDateTime postedDate     = parseDateTime(postedDateRaw, keyword);
         LocalDateTime bidClosingTime = parseDateTime(bidClosingRaw, keyword);
         Duration remainingTime       = parseDuration(remainingRaw, keyword);
 
@@ -563,8 +712,11 @@ public final class DownloadWorker implements Runnable {
             .tmbtNumber(keyword)
             .packageName(packageName)
             .procuringEntity(procuringEntity)
+            .postedDate(postedDate)
+            .packageExecutionTime(executionTime)
             .bidClosingTime(bidClosingTime)
             .remainingTimeToClosing(remainingTime)
+            .tenderLink(safeCurrentUrl(driver))
             .build();
     }
 
@@ -585,7 +737,11 @@ public final class DownloadWorker implements Runnable {
                 if (titles.isEmpty()) {
                     continue;
                 }
-                String titleText = normalizeComparableText(titles.get(0).getText());
+                String rawTitle = titles.get(0).getText();
+                if (rawTitle == null || rawTitle.trim().isEmpty()) {
+                    rawTitle = titles.get(0).getAttribute("textContent");
+                }
+                String titleText = normalizeComparableText(rawTitle);
                 if (!titleText.contains(normalizedTarget)) {
                     continue;
                 }
@@ -595,6 +751,9 @@ public final class DownloadWorker implements Runnable {
                 );
                 for (WebElement value : values) {
                     String text = value.getText();
+                    if (text == null || text.trim().isEmpty()) {
+                        text = value.getAttribute("textContent");
+                    }
                     if (text != null) {
                         String trimmed = text.trim();
                         if (!trimmed.isEmpty()) {
@@ -625,6 +784,117 @@ public final class DownloadWorker implements Runnable {
         return null;
     }
 
+    private String readInfoValueByLabelsFromRenderedDom(WebDriver driver, List<String> labels) {
+        return readInfoValueByLabelsFromRenderedDom(driver, null, labels);
+    }
+
+    private String readInfoValueByLabelsFromRenderedDom(WebDriver driver, By scopeLocator, List<String> labels) {
+        if (labels == null || labels.isEmpty()) {
+            return null;
+        }
+        WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(5));
+        try {
+            return wait.until(current -> {
+                for (String label : labels) {
+                    String normalizedTarget = normalizeComparableText(label);
+                    try {
+                        List<WebElement> scopes = scopeLocator == null ? List.of() : current.findElements(scopeLocator);
+                        List<WebElement> rows = new ArrayList<>();
+                        if (scopes.isEmpty()) {
+                            rows.addAll(current.findElements(By.xpath("//div[contains(@class,'infomation__content')]")));
+                        } else {
+                            for (WebElement scope : scopes) {
+                                rows.addAll(scope.findElements(By.xpath(".//div[contains(@class,'infomation__content')]")));
+                            }
+                        }
+
+                        for (WebElement row : rows) {
+                            List<WebElement> titles = row.findElements(
+                                By.xpath(".//div[contains(@class,'infomation__content__title')]")
+                            );
+                            if (titles.isEmpty()) {
+                                continue;
+                            }
+                            String rawTitle = titles.get(0).getText();
+                            if (rawTitle == null || rawTitle.trim().isEmpty()) {
+                                rawTitle = titles.get(0).getAttribute("textContent");
+                            }
+                            String titleText = normalizeComparableText(rawTitle);
+                            if (!titleText.contains(normalizedTarget)) {
+                                continue;
+                            }
+                            List<WebElement> values = row.findElements(
+                                By.xpath("./div[not(contains(@class,'infomation__content__title'))]")
+                            );
+                            for (WebElement value : values) {
+                                String text = value.getText();
+                                if (text == null || text.trim().isEmpty()) {
+                                    text = value.getAttribute("textContent");
+                                }
+                                if (text != null && !text.trim().isEmpty()) {
+                                    return text.trim();
+                                }
+                            }
+                        }
+                    } catch (RuntimeException ignored) {
+                        // ignore and try next label, or wait will retry
+                    }
+                }
+                return null;
+            });
+        } catch (TimeoutException ex) {
+            return null;
+        }
+    }
+
+    private void logBbmtMoneyFields(WebDriver driver, String keyword) {
+        try {
+            List<String> rows = collectInfoRowsFromRenderedDom(driver, BBMT_INFO_PANE);
+            List<String> moneyRows = new ArrayList<>();
+            for (String row : rows) {
+                String normalized = normalizeComparableText(row);
+                if (normalized.contains("du toan") || normalized.contains("gia goi thau")) {
+                    moneyRows.add(row);
+                }
+            }
+            if (moneyRows.isEmpty()) {
+                Utils.logStatus(keyword, "INFO", 0,
+                    "BBMT money fields visible: <none>");
+                return;
+            }
+            Utils.logStatus(keyword, "INFO", 0,
+                "BBMT money fields visible: " + String.join(" | ", moneyRows));
+        } catch (RuntimeException ex) {
+            Utils.logStatus(keyword, "WARN", 0,
+                "Cannot log BBMT money fields: " + rootMessage(ex));
+        }
+    }
+
+    private List<String> collectInfoRowsFromRenderedDom(WebDriver driver, By scopeLocator) {
+        List<WebElement> scopes = scopeLocator == null ? List.of() : driver.findElements(scopeLocator);
+        List<WebElement> rows = new ArrayList<>();
+        if (scopes.isEmpty()) {
+            rows.addAll(driver.findElements(By.xpath("//div[contains(@class,'infomation__content')]")));
+        } else {
+            for (WebElement scope : scopes) {
+                rows.addAll(scope.findElements(By.xpath(".//div[contains(@class,'infomation__content')]")));
+            }
+        }
+
+        List<String> result = new ArrayList<>();
+        for (WebElement row : rows) {
+            String text = row.getText();
+            if (text == null || text.trim().isEmpty()) {
+                text = row.getAttribute("textContent");
+            }
+            if (text == null || text.isBlank()) {
+                continue;
+            }
+            result.add(text.replaceAll("\\s+", " ").trim());
+        }
+        return result;
+    }
+
     /**
      * Lấy text "Còn lại: X ngày Y giờ Z phút" từ sidebar bên phải.
      * Thử selector trước, fallback quét tất cả <p>.
@@ -635,9 +905,19 @@ public final class DownloadWorker implements Runnable {
             return result;
         }
         try {
-            for (WebElement p : driver.findElements(By.tagName("p"))) {
+            List<WebElement> paragraphs = driver.findElements(By.tagName("p"));
+            for (int i = 0; i < paragraphs.size() - 1; i++) {
+                String label = paragraphs.get(i).getText().trim();
+                if (label.contains("Thời gian còn lại")) {
+                    String value = paragraphs.get(i + 1).getText().trim();
+                    if (!value.isBlank()) {
+                        return value;
+                    }
+                }
+            }
+            for (WebElement p : paragraphs) {
                 String text = p.getText().trim();
-                if (text.contains("Còn lại") || text.contains("Con lai")) {
+                if ((text.contains("Còn lại") || text.contains("Con lai")) && text.matches(".*\\d+.*")) {
                     return text;
                 }
             }
@@ -655,6 +935,9 @@ public final class DownloadWorker implements Runnable {
                 }
                 for (WebElement el : els) {
                     String text = el.getText();
+                    if (text == null || text.trim().isEmpty()) {
+                        text = el.getAttribute("textContent");
+                    }
                     if (text == null) {
                         continue;
                     }
@@ -766,6 +1049,246 @@ public final class DownloadWorker implements Runnable {
         return sb.toString();
     }
 
+    private int downloadTenderNoticeAttachments(
+        WebDriver driver, Path downloadDir, KeywordTarget target, String keyword
+    ) {
+        int downloaded = 0;
+        downloaded += downloadTenderSubtabAttachments(
+            driver,
+            downloadDir,
+            target,
+            keyword,
+            TENDER_HSMT_CLARIFICATION_TAB,
+            TENDER_HSMT_CLARIFICATION_PANE,
+            "Làm rõ HSMT",
+            "clear-HSMT",
+            HSMT_CLARIFICATION_FOLDER_NAME
+        );
+        downloaded += downloadTenderSubtabAttachments(
+            driver,
+            downloadDir,
+            target,
+            keyword,
+            TENDER_PETITION_TAB,
+            TENDER_PETITION_PANE,
+            "Kiến nghị",
+            "kien-nghi",
+            PETITION_FOLDER_NAME
+        );
+        return downloaded;
+    }
+
+    private int downloadTenderSubtabAttachments(
+        WebDriver driver,
+        Path downloadDir,
+        KeywordTarget target,
+        String keyword,
+        By tabLocator,
+        By paneLocator,
+        String tabName,
+        String paneId,
+        String targetSubfolderName
+    ) {
+        if (!clickTenderSubtabIfPresent(driver, tabLocator, paneLocator, tabName, keyword)) {
+            return 0;
+        }
+
+        List<String> attachmentNames = collectTenderAttachmentNames(driver, paneId);
+        if (attachmentNames.isEmpty()) {
+            Utils.logStatus(keyword, "INFO", 0,
+                "No attachments found in tab '" + tabName + "'. Skipping.");
+            return 0;
+        }
+
+        Utils.logStatus(keyword, "INFO", 0,
+            "Found " + attachmentNames.size() + " attachment(s) in tab '" + tabName + "'.");
+
+        int downloaded = 0;
+        Path targetFolder = resolveAutoDownloadFolder(target).resolve(targetSubfolderName);
+        for (String attachmentName : attachmentNames) {
+            downloadTenderSubtabAttachmentByName(
+                driver, downloadDir, targetFolder, keyword, tabName, paneId, attachmentName);
+            downloaded++;
+        }
+        return downloaded;
+    }
+
+    private void downloadTenderSubtabAttachmentByName(
+        WebDriver driver,
+        Path downloadDir,
+        Path targetFolder,
+        String keyword,
+        String tabName,
+        String paneId,
+        String attachmentName
+    ) {
+        int attempts = 3;
+        RuntimeException lastError = null;
+
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                WebElement attachment = findTenderAttachmentByName(driver, paneId, attachmentName);
+                Utils.logStatus(keyword, "INFO", attempt,
+                    tabName + ": downloading attachment - " + attachmentName);
+
+                Set<Path> before = Utils.snapshotCompletedFiles(downloadDir);
+                long clickStartedAt = System.nanoTime();
+                clickAttachmentRobust(driver, attachment);
+                SeleniumHelper.normalizeWindows(driver,
+                    url -> url.toLowerCase().contains("render=detail-v2"));
+
+                if (SeleniumHelper.isDisposableCurrentUrl(driver)) {
+                    throw new IllegalStateException(
+                        "Browser navigated away after attachment click: " + driver.getCurrentUrl());
+                }
+
+                Path downloaded = Utils.safeWaitForDownloadedFile(
+                    downloadDir, before, DOWNLOAD_TIMEOUT, ATTACHMENT_EXTENSIONS);
+                if (downloaded == null) {
+                    throw new TimeoutException("Download timeout waiting for attachment: " + attachmentName);
+                }
+                if (!Utils.isNonEmptyRegularFile(downloaded)) {
+                    throw new IllegalStateException("Downloaded attachment is invalid or empty: " + downloaded);
+                }
+
+                Path finalFile = Utils.moveFileToTargetFolderUnique(downloaded, targetFolder);
+                long elapsedMs = (System.nanoTime() - clickStartedAt) / 1_000_000L;
+                Utils.logStatus(keyword, "INFO", attempt,
+                    tabName + " attachment saved: " + finalFile.getFileName() + " | waitMs=" + elapsedMs);
+                return;
+            } catch (StaleElementReferenceException ex) {
+                lastError = ex;
+                Utils.logStatus(keyword, "WARN", attempt,
+                    tabName + " attachment changed while clicking. Retrying...");
+            } catch (RuntimeException ex) {
+                lastError = ex;
+                Utils.logStatus(keyword, "WARN", attempt,
+                    tabName + " attachment download attempt failed: " + rootMessage(ex));
+            }
+        }
+
+        throw lastError == null
+            ? new IllegalStateException(tabName + " attachment download failed after retry attempts.")
+            : lastError;
+    }
+
+    private void ensureTenderInfoGeneralActive(WebDriver driver, String keyword) {
+        clickTenderSubtabIfPresent(driver, TENDER_INFO_GENERAL_TAB, TENDER_INFO_GENERAL_PANE, "Thông tin chung", keyword);
+    }
+
+    private boolean clickTenderSubtabIfPresent(WebDriver driver, By tabLocator, By paneLocator, String tabName, String keyword) {
+        try {
+            List<WebElement> tabs = driver.findElements(tabLocator);
+            if (tabs.isEmpty()) {
+                Utils.logStatus(keyword, "INFO", 0,
+                    "Tender subtab '" + tabName + "' not present. Skipping.");
+                return false;
+            }
+            WebElement tab = tabs.get(0);
+            ((JavascriptExecutor) driver).executeScript("arguments[0].scrollIntoView({block:'center', inline:'center'});", tab);
+            try {
+                SeleniumHelper.safeClick(driver, tab);
+            } catch (RuntimeException ex) {
+                ((JavascriptExecutor) driver).executeScript("arguments[0].click();", tab);
+            }
+            waitForPaneActivated(driver, paneLocator);
+            Utils.logStatus(keyword, "INFO", 0, "Tender subtab '" + tabName + "' activated.");
+            return true;
+        } catch (RuntimeException ex) {
+            Utils.logStatus(keyword, "WARN", 0,
+                "Cannot activate tender subtab '" + tabName + "': " + rootMessage(ex));
+            return false;
+        }
+    }
+
+    private void waitForPaneActivated(WebDriver driver, By paneLocator) {
+        WebDriverWait wait = new WebDriverWait(driver, TAB_SWITCH_WAIT);
+        wait.until(current -> {
+            List<WebElement> panes = current.findElements(paneLocator);
+            if (panes.isEmpty()) {
+                return false;
+            }
+            WebElement pane = panes.get(0);
+            String paneClass = pane.getAttribute("class");
+            return pane.isDisplayed()
+                || (paneClass != null && (paneClass.contains("active") || paneClass.contains("show")));
+        });
+    }
+
+    private List<String> collectTenderAttachmentNames(WebDriver driver, String paneId) {
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        try {
+            By locator = tenderAttachmentLocator(paneId);
+            new WebDriverWait(driver, Duration.ofSeconds(3)).until(current -> !current.findElements(locator).isEmpty());
+        } catch (TimeoutException ignored) {
+            // No files in this tab.
+        }
+        try {
+            for (WebElement element : driver.findElements(tenderAttachmentLocator(paneId))) {
+                String text = element.getText();
+                if (text != null && isAttachmentFileName(text.trim())) {
+                    names.add(text.trim());
+                }
+            }
+        } catch (RuntimeException ignored) {
+            return List.of();
+        }
+        return new ArrayList<>(names);
+    }
+
+    private WebElement findTenderAttachmentByName(WebDriver driver, String paneId, String attachmentName) {
+        String normalizedExpected = normalizeComparableText(attachmentName);
+        for (WebElement element : driver.findElements(tenderAttachmentLocator(paneId))) {
+            String text = element.getText();
+            if (text != null && normalizeComparableText(text).equals(normalizedExpected)) {
+                return element;
+            }
+        }
+        throw new NoSuchElementException("Attachment not found: " + attachmentName);
+    }
+
+    private By tenderAttachmentLocator(String paneId) {
+        return By.xpath("//div[@id='" + paneId + "']//span[contains(@class,'text-blue-4D7AE6')]");
+    }
+
+    private boolean isAttachmentFileName(String text) {
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        String lowered = text.trim().toLowerCase();
+        for (String extension : ATTACHMENT_EXTENSIONS) {
+            if (lowered.endsWith(extension)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void clickAttachmentRobust(WebDriver driver, WebElement attachment) {
+        ((JavascriptExecutor) driver).executeScript("arguments[0].scrollIntoView({block:'center', inline:'center'});", attachment);
+        RuntimeException lastError = null;
+        try {
+            SeleniumHelper.safeClick(driver, attachment);
+            return;
+        } catch (RuntimeException ex) {
+            lastError = ex;
+        }
+        try {
+            ((JavascriptExecutor) driver).executeScript("arguments[0].click();", attachment);
+            return;
+        } catch (RuntimeException ex) {
+            lastError = ex;
+        }
+        try {
+            WebElement parent = attachment.findElement(By.xpath("./ancestor::div[1]"));
+            SeleniumHelper.safeClick(driver, parent);
+            return;
+        } catch (RuntimeException ex) {
+            lastError = ex;
+        }
+        throw lastError == null ? new IllegalStateException("Cannot click attachment.") : lastError;
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     // Step 3 helper: BBMT download
     // ────────────────────────────────────────────────────────────────────────
@@ -786,9 +1309,8 @@ public final class DownloadWorker implements Runnable {
             Set<Path> before = Utils.snapshotPdfFiles(downloadDir);
             Utils.logStatus(keyword, "INFO", attempt,
                 "BBMT attempt started: locating download trigger.");
-            WebElement attachment = findFirstClickable(driver, bbmtTriggers, Duration.ofSeconds(15));
             long clickStartedAt = System.nanoTime();
-            clickBbmtTrigger(driver, attachment);
+            clickFirstDownloadTrigger(driver, bbmtTriggers, Duration.ofSeconds(15));
             Utils.logStatus(keyword, "INFO", attempt,
                 "BBMT trigger clicked. Waiting for PDF to appear...");
             SeleniumHelper.normalizeWindows(driver,
@@ -854,6 +1376,25 @@ public final class DownloadWorker implements Runnable {
             )));
     }
 
+    private void waitForBbmtInfoReady(WebDriver driver) {
+        WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(8));
+        wait.until(current -> {
+            List<WebElement> panes = current.findElements(BBMT_INFO_PANE);
+            for (WebElement pane : panes) {
+                String paneClass = pane.getAttribute("class");
+                boolean active = pane.isDisplayed()
+                    || (paneClass != null && (paneClass.contains("active") || paneClass.contains("show")));
+                if (!active) {
+                    continue;
+                }
+                if (!pane.findElements(By.xpath(".//div[contains(@class,'infomation__content')]")).isEmpty()) {
+                    return true;
+                }
+            }
+            return false;
+        });
+    }
+
     private boolean hasAnyVisible(WebDriver driver, List<By> locators) {
         for (By locator : locators) {
             List<WebElement> elements = driver.findElements(locator);
@@ -866,6 +1407,21 @@ public final class DownloadWorker implements Runnable {
         return false;
     }
 
+    private boolean hasVisibleWithWait(WebDriver driver, By locator, Duration timeout) {
+        try {
+            return new WebDriverWait(driver, timeout).until(current -> {
+                for (WebElement element : current.findElements(locator)) {
+                    if (element.isDisplayed()) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+        } catch (TimeoutException ex) {
+            return false;
+        }
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     // Step 4 helper: KQLCNT download
     // ────────────────────────────────────────────────────────────────────────
@@ -873,40 +1429,178 @@ public final class DownloadWorker implements Runnable {
     private Path downloadKqlcntDecision(
         WebDriver driver, Path downloadDir, KeywordTarget target, String keyword
     ) {
-        Utils.logStatus(keyword, "INFO", 0,
-            "KQLCNT: locating decision attachment.");
-        WebElement attachment = findFirstClickable(driver,
-            List.of(KQLCNT_DECISION_PRIMARY, KQLCNT_DECISION_FALLBACK), Duration.ofSeconds(15));
+        List<By> kqlcntTriggers = List.of(KQLCNT_DECISION_PRIMARY, KQLCNT_DECISION_FALLBACK);
+        int attempts = 3;
+        RuntimeException lastError = null;
 
-        Set<Path> before = Utils.snapshotPdfFiles(downloadDir);
-        long clickStartedAt = System.nanoTime();
-        SeleniumHelper.safeClick(driver, attachment);
-        Utils.logStatus(keyword, "INFO", 0,
-            "KQLCNT trigger clicked. Waiting for PDF to appear...");
-        SeleniumHelper.normalizeWindows(driver,
-            url -> url.toLowerCase().contains("render=detail-v2"));
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                Utils.logStatus(keyword, "INFO", attempt,
+                    "KQLCNT: locating decision attachment.");
+                Set<Path> before = Utils.snapshotPdfFiles(downloadDir);
+                long clickStartedAt = System.nanoTime();
+                clickFirstDownloadTrigger(driver, kqlcntTriggers, Duration.ofSeconds(15));
+                Utils.logStatus(keyword, "INFO", attempt,
+                    "KQLCNT trigger clicked. Waiting for PDF to appear...");
+                SeleniumHelper.normalizeWindows(driver,
+                    url -> url.toLowerCase().contains("render=detail-v2"));
 
-        if (SeleniumHelper.isDisposableCurrentUrl(driver)) {
-            throw new IllegalStateException(
-                "Browser navigated away after KQLCNT download click: "
-                + driver.getCurrentUrl());
+                if (SeleniumHelper.isDisposableCurrentUrl(driver)) {
+                    throw new IllegalStateException(
+                        "Browser navigated away after KQLCNT download click: "
+                        + driver.getCurrentUrl());
+                }
+
+                Path downloaded = Utils.safeWaitForPdf(downloadDir, before, DOWNLOAD_TIMEOUT);
+                if (downloaded == null) {
+                    throw new TimeoutException(
+                        "Download timeout waiting for KQLCNT Quyết định phê duyệt PDF.");
+                }
+                if (!Utils.isNonEmptyPdf(downloaded)) {
+                    throw new IllegalStateException(
+                        "Downloaded KQLCNT file is invalid or empty: " + downloaded);
+                }
+
+                Path finalFile = Utils.movePdfToTargetFolder(downloaded, resolveAutoDownloadFolder(target));
+                long elapsedMs = (System.nanoTime() - clickStartedAt) / 1_000_000L;
+                Utils.logStatus(keyword, "INFO", attempt,
+                    "KQLCNT decision PDF saved: " + finalFile.getFileName() + " | waitMs=" + elapsedMs);
+                return finalFile;
+            } catch (StaleElementReferenceException ex) {
+                lastError = ex;
+                Utils.logStatus(keyword, "WARN", attempt,
+                    "KQLCNT attachment changed while clicking. Retrying...");
+            }
         }
 
-        Path downloaded = Utils.safeWaitForPdf(downloadDir, before, DOWNLOAD_TIMEOUT);
-        if (downloaded == null) {
-            throw new TimeoutException(
-                "Download timeout waiting for KQLCNT Quyết định phê duyệt PDF.");
-        }
-        if (!Utils.isNonEmptyPdf(downloaded)) {
-            throw new IllegalStateException(
-                "Downloaded KQLCNT file is invalid or empty: " + downloaded);
+        throw lastError == null
+            ? new IllegalStateException("KQLCNT download failed after retry attempts.")
+            : lastError;
+    }
+
+    private Path downloadKqlcntWinningPriceExcel(
+        WebDriver driver, Path downloadDir, KeywordTarget target, String keyword
+    ) {
+        List<By> excelTriggers = List.of(KQLCNT_WINNING_PRICE_EXCEL_BUTTON);
+        int attempts = 3;
+        RuntimeException lastError = null;
+
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                Utils.logStatus(keyword, "INFO", attempt,
+                    "KQLCNT: locating winning price Excel button.");
+                Set<Path> before = Utils.snapshotCompletedFiles(downloadDir);
+                long clickStartedAt = System.nanoTime();
+                clickFirstDownloadTrigger(driver, excelTriggers, Duration.ofSeconds(15));
+                Utils.logStatus(keyword, "INFO", attempt,
+                    "KQLCNT winning price Excel clicked. Waiting for Excel to appear...");
+                SeleniumHelper.normalizeWindows(driver,
+                    url -> url.toLowerCase().contains("render=detail-v2"));
+
+                if (SeleniumHelper.isDisposableCurrentUrl(driver)) {
+                    throw new IllegalStateException(
+                        "Browser navigated away after KQLCNT winning price Excel click: "
+                        + driver.getCurrentUrl());
+                }
+
+                Path downloaded = Utils.safeWaitForDownloadedFile(
+                    downloadDir, before, DOWNLOAD_TIMEOUT, EXCEL_EXTENSIONS);
+                if (downloaded == null) {
+                    throw new TimeoutException(
+                        "Download timeout waiting for KQLCNT winning price Excel.");
+                }
+                if (!Utils.isNonEmptyRegularFile(downloaded)) {
+                    throw new IllegalStateException(
+                        "Downloaded KQLCNT winning price Excel is invalid or empty: " + downloaded);
+                }
+
+                Path finalFile = Utils.moveFileToTargetFolder(downloaded, resolveAutoDownloadFolder(target));
+                long elapsedMs = (System.nanoTime() - clickStartedAt) / 1_000_000L;
+                Utils.logStatus(keyword, "INFO", attempt,
+                    "KQLCNT winning price Excel saved: " + finalFile.getFileName() + " | waitMs=" + elapsedMs);
+                return finalFile;
+            } catch (StaleElementReferenceException ex) {
+                lastError = ex;
+                Utils.logStatus(keyword, "WARN", attempt,
+                    "KQLCNT winning price Excel button changed while clicking. Retrying...");
+            } catch (RuntimeException ex) {
+                lastError = ex;
+                Utils.logStatus(keyword, "WARN", attempt,
+                    "KQLCNT winning price Excel download attempt failed: " + rootMessage(ex));
+            }
         }
 
-        Path finalFile = Utils.movePdfToTargetFolder(downloaded, resolveAutoDownloadFolder(target));
-        long elapsedMs = (System.nanoTime() - clickStartedAt) / 1_000_000L;
-        Utils.logStatus(keyword, "INFO", 0,
-            "KQLCNT decision PDF saved: " + finalFile.getFileName() + " | waitMs=" + elapsedMs);
-        return finalFile;
+        throw lastError == null
+            ? new IllegalStateException("KQLCNT winning price Excel download failed after retry attempts.")
+            : lastError;
+    }
+
+    private Path downloadKqlcntEhsdtReport(
+        WebDriver driver, Path downloadDir, KeywordTarget target, String keyword
+    ) {
+        List<By> reportTriggers = List.of(KQLCNT_EHSDT_REPORT_PRIMARY);
+        int attempts = 3;
+        RuntimeException lastError = null;
+
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                Utils.logStatus(keyword, "INFO", attempt,
+                    "KQLCNT: locating E-HSDT evaluation report attachment.");
+                Set<Path> before = Utils.snapshotPdfFiles(downloadDir);
+                long clickStartedAt = System.nanoTime();
+                long clickStartedAtMs = System.currentTimeMillis();
+                clickFirstDownloadTrigger(driver, reportTriggers, Duration.ofSeconds(15));
+                Utils.logStatus(keyword, "INFO", attempt,
+                    "KQLCNT E-HSDT report trigger clicked. Waiting for file to appear...");
+                SeleniumHelper.normalizeWindows(driver,
+                    url -> url.toLowerCase().contains("render=detail-v2"));
+
+                if (SeleniumHelper.isDisposableCurrentUrl(driver)) {
+                    throw new IllegalStateException(
+                        "Browser navigated away after KQLCNT E-HSDT report click: "
+                        + driver.getCurrentUrl());
+                }
+
+                Path downloaded = Utils.safeWaitForDownloadedFile(
+                    downloadDir, before, DOWNLOAD_TIMEOUT, ATTACHMENT_EXTENSIONS
+                );
+                if (downloaded == null) {
+                    Path fallback = Utils.findLatestNonEmptyFileSince(
+                        downloadDir, clickStartedAtMs - 2_000L, ATTACHMENT_EXTENSIONS
+                    );
+                    if (fallback != null) {
+                        downloaded = fallback;
+                        Utils.logStatus(keyword, "WARN", attempt,
+                            "KQLCNT E-HSDT report timeout fallback matched file: " + fallback.getFileName());
+                    } else {
+                        throw new TimeoutException(
+                            "Download timeout waiting for KQLCNT Báo cáo đánh giá tổng hợp E-HSDT file.");
+                    }
+                }
+                if (!Utils.isNonEmptyRegularFile(downloaded)) {
+                    throw new IllegalStateException(
+                        "Downloaded KQLCNT E-HSDT report file is invalid or empty: " + downloaded);
+                }
+
+                Path finalFile = Utils.moveFileToTargetFolder(downloaded, resolveAutoDownloadFolder(target));
+                long elapsedMs = (System.nanoTime() - clickStartedAt) / 1_000_000L;
+                Utils.logStatus(keyword, "INFO", attempt,
+                    "KQLCNT E-HSDT report file saved: " + finalFile.getFileName() + " | waitMs=" + elapsedMs);
+                return finalFile;
+            } catch (StaleElementReferenceException ex) {
+                lastError = ex;
+                Utils.logStatus(keyword, "WARN", attempt,
+                    "KQLCNT E-HSDT report attachment changed while clicking. Retrying...");
+            } catch (RuntimeException ex) {
+                lastError = ex;
+                Utils.logStatus(keyword, "WARN", attempt,
+                    "KQLCNT E-HSDT report download attempt failed: " + rootMessage(ex));
+            }
+        }
+
+        throw lastError == null
+            ? new IllegalStateException("KQLCNT E-HSDT report download failed after retry attempts.")
+            : lastError;
     }
 
     private Path resolveAutoDownloadFolder(KeywordTarget target) {
@@ -1038,6 +1732,39 @@ public final class DownloadWorker implements Runnable {
             "None of the provided locators matched a clickable element.");
     }
 
+    private void clickFirstDownloadTrigger(WebDriver driver, List<By> locators, Duration timeout) {
+        RuntimeException lastError = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            for (By locator : locators) {
+                try {
+                    WebElement element = SeleniumHelper.waitClickable(driver, locator, timeout);
+                    SeleniumHelper.safeClick(driver, element);
+                    return;
+                } catch (StaleElementReferenceException ex) {
+                    lastError = ex;
+                    // DOM re-rendered between locate and click; re-find the element.
+                } catch (TimeoutException ex) {
+                    lastError = ex;
+                } catch (RuntimeException ex) {
+                    lastError = ex;
+                    try {
+                        WebElement element = SeleniumHelper.waitClickable(driver, locator, QUICK_LOCATOR_WAIT);
+                        ((JavascriptExecutor) driver).executeScript("arguments[0].click();", element);
+                        return;
+                    } catch (StaleElementReferenceException stale) {
+                        lastError = stale;
+                    } catch (RuntimeException ignored) {
+                        // try next locator/attempt
+                    }
+                }
+            }
+        }
+
+        throw lastError == null
+            ? new NoSuchElementException("No clickable download trigger found.")
+            : lastError;
+    }
+
     private String extractTargetId(String href) {
         if (href == null || href.isBlank()) {
             return null;
@@ -1075,17 +1802,67 @@ public final class DownloadWorker implements Runnable {
         Throwable root = throwable;
         while (root.getCause() != null) root = root.getCause();
         String message = root.getMessage();
-        return (message == null || message.isBlank())
-            ? root.getClass().getSimpleName() : message;
+        if (message == null || message.isBlank()) {
+            return root.getClass().getSimpleName();
+        }
+        String oneLine = message.replaceAll("\\s+", " ").trim();
+        if (oneLine.length() > 280) {
+            return oneLine.substring(0, 280) + "...";
+        }
+        return oneLine;
     }
 
     private void exportBidInfoJson(BidSheetRow bidInfo, String keyword) {
         synchronized (BID_INFO_JSON_LOCK) {
             Utils.ensureDirectory(BID_INFO_DATA_DIR);
+            String key = buildRowKey(bidInfo);
+            BID_INFO_ROWS.removeIf(row -> buildRowKey(row).equals(key));
             BID_INFO_ROWS.add(bidInfo);
             persistBidInfoRows();
             Utils.logStatus(keyword, "INFO", 0, "Bid info exported.");
         }
+    }
+
+    private static List<BidSheetRow> deduplicateRows(List<BidSheetRow> rows) {
+        LinkedHashMap<String, BidSheetRow> dedup = new LinkedHashMap<>();
+        for (BidSheetRow row : rows) {
+            String key = buildRowKey(row);
+            dedup.remove(key);
+            dedup.put(key, row);
+        }
+        return new ArrayList<>(dedup.values());
+    }
+
+    private static String buildRowKey(BidSheetRow row) {
+        String tmbt = row == null || row.tmbtNumber() == null ? "" : row.tmbtNumber().trim();
+        String parent = row == null || row.parentFolderName() == null ? "" : row.parentFolderName().trim();
+        String contract = row == null || row.contractPerformanceFolder() == null ? "" : row.contractPerformanceFolder().trim();
+        return tmbt + "|" + parent + "|" + contract;
+    }
+
+    private static String buildRowKeyFromStateRecord(RunStateStore.StateRecord record) {
+        if (record == null || record.keyword() == null || record.keyword().isBlank()) {
+            return null;
+        }
+
+        String parent = "";
+        String contract = "";
+        try {
+            String folderPath = record.folderPath();
+            if (folderPath != null && !folderPath.isBlank()) {
+                Path folder = Path.of(folderPath).toAbsolutePath().normalize();
+                if (folder.getFileName() != null) {
+                    contract = folder.getFileName().toString().trim();
+                }
+                if (folder.getParent() != null && folder.getParent().getFileName() != null) {
+                    parent = folder.getParent().getFileName().toString().trim();
+                }
+            }
+        } catch (Exception ignored) {
+            // best effort mapping only
+        }
+
+        return record.keyword().trim() + "|" + parent + "|" + contract;
     }
 
     private static String buildBidInfoListJson(List<BidSheetRow> rows) {
@@ -1119,6 +1896,7 @@ public final class DownloadWorker implements Runnable {
     }
 
     private static String buildBidInfoItemJson(BidSheetRow row) {
+        String postedDate = row.postedDate() == null ? null : row.postedDate().format(JSON_TIME_FORMAT);
         String bidClosing = row.bidClosingTime() == null ? null : row.bidClosingTime().format(JSON_TIME_FORMAT);
         Long remainingSeconds = row.remainingTimeToClosing() == null ? null : row.remainingTimeToClosing().getSeconds();
         String estimatedBudget = row.estimatedBudget() == null ? null : row.estimatedBudget().toString();
@@ -1130,11 +1908,26 @@ public final class DownloadWorker implements Runnable {
             + "  \"contractPerformanceFolder\": " + quoteJson(row.contractPerformanceFolder()) + ",\n"
             + "  \"parentFolderName\": " + quoteJson(row.parentFolderName()) + ",\n"
             + "  \"estimatedBudget\": " + quoteJson(estimatedBudget) + ",\n"
+            + "  \"postedDate\": " + quoteJson(postedDate) + ",\n"
+            + "  \"packageExecutionTime\": " + quoteJson(row.packageExecutionTime()) + ",\n"
             + "  \"status\": " + (row.status() == null ? "null" : quoteJson(row.status().name())) + ",\n"
             + "  \"bidClosingTime\": " + quoteJson(bidClosing) + ",\n"
             + "  \"remainingTimeSeconds\": " + (remainingSeconds == null ? "null" : remainingSeconds) + ",\n"
-            + "  \"folderLink\": " + quoteJson(row.folderLink()) + "\n"
+            + "  \"folderLink\": " + quoteJson(row.folderLink()) + ",\n"
+            + "  \"tenderLink\": " + quoteJson(row.tenderLink()) + "\n"
             + "}";
+    }
+
+    private String safeCurrentUrl(WebDriver driver) {
+        try {
+            String url = driver == null ? null : driver.getCurrentUrl();
+            if (url == null || url.isBlank()) {
+                return null;
+            }
+            return url;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private static String quoteJson(String value) {

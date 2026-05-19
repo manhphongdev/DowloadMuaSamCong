@@ -3,15 +3,22 @@ package vn.muasamcong.downloader.app;
 import java.awt.Desktop;
 import java.io.IOException;
 import java.net.URI;
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -30,6 +37,7 @@ import javafx.beans.property.SimpleBooleanProperty;
 import javafx.beans.value.ChangeListener;
 import javax.swing.JFileChooser;
 import javax.swing.SwingUtilities;
+import javax.swing.UIManager;
 import javafx.application.Application;
 import javafx.collections.FXCollections;
 import javafx.collections.ListChangeListener;
@@ -44,25 +52,37 @@ import javafx.scene.control.ButtonType;
 import javafx.scene.control.CheckBox;
 import javafx.scene.control.ComboBox;
 import javafx.scene.control.ContentDisplay;
+import javafx.scene.control.ContextMenu;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
+import javafx.scene.control.MenuItem;
 import javafx.scene.control.ProgressIndicator;
 import javafx.scene.control.SelectionMode;
 import javafx.scene.control.Separator;
 import javafx.scene.control.Spinner;
-import javafx.scene.control.RadioButton;
-import javafx.scene.control.ToggleGroup;
+import javafx.scene.control.TableCell;
+import javafx.scene.control.TableColumn;
+import javafx.scene.control.TableView;
 import javafx.scene.control.Tab;
 import javafx.scene.control.TabPane;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
+import javafx.scene.control.TextInputDialog;
+import javafx.scene.control.Tooltip;
 import javafx.scene.control.Alert;
+import javafx.scene.input.Clipboard;
+import javafx.scene.input.ClipboardContent;
+import javafx.scene.paint.Color;
+import javafx.scene.text.Font;
+import javafx.scene.text.FontWeight;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.FlowPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.control.SplitPane;
 import javafx.scene.layout.VBox;
 import javafx.stage.FileChooser;
@@ -72,6 +92,7 @@ import vn.muasamcong.downloader.core.DownloadCoordinator;
 import vn.muasamcong.downloader.core.RunStats;
 import vn.muasamcong.downloader.export.GoogleSheetsSyncService;
 import vn.muasamcong.downloader.store.AutoRunConfigStore;
+import vn.muasamcong.downloader.store.BrowserProfileConfigStore;
 import vn.muasamcong.downloader.store.FolderSelectionStore;
 import vn.muasamcong.downloader.store.GoogleSheetsConfigStore;
 import vn.muasamcong.downloader.store.RunStateStore;
@@ -85,9 +106,21 @@ import vn.muasamcong.downloader.util.Utils;
 public final class DownloaderFxApp extends Application {
 
     private static final Pattern KEYWORD_PATTERN = Pattern.compile("keyword=\"([^\"]+)\"");
+    private static final Pattern RUNTIME_LOG_PATTERN = Pattern.compile(
+        "^(\\S+)\\s+(START|INFO|WARN|FAIL|SUCCESS|STOP|DONE)\\s*(.*)$"
+    );
+    private static final Pattern LOADED_KEYWORD_PATTERN = Pattern.compile("^Loaded keyword:\\s+(\\S+)\\s+folder=(.*)$");
     private static final Pattern DOWNLOADED_FILES_PATTERN = Pattern.compile("Downloaded files:\\s*(\\d+)\\s*/\\s*(\\d+)");
     private static final Path BID_ROWS_JSON_FILE = Utils.dataFile("bid_sheet_rows.json").toAbsolutePath().normalize();
+    private static final String TEST_DOWNLOAD_ENDPOINT =
+        "http://localhost:1234/api/download/file/browser/public";
+    private static final HttpClient TEST_DOWNLOAD_HTTP_CLIENT = HttpClient.newBuilder()
+        .followRedirects(HttpClient.Redirect.NORMAL)
+        .connectTimeout(Duration.ofSeconds(10))
+        .build();
     private static final DateTimeFormatter NEXT_RUN_FORMAT = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
+    private static final DateTimeFormatter LOG_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final DateTimeFormatter PROGRESS_TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     private Stage ownerStage;
     private ListView<FolderItem> folderListView;
@@ -105,25 +138,32 @@ public final class DownloaderFxApp extends Application {
     private Button expandProgressButton;
     private Button clearStateButton;
     private Button sheetsConfigButton;
+    private Button testDownloadButton;
     private Button saveUpdateConfigButton;
     private Button checkUpdateButton;
     private Button downloadUpdateButton;
+    private Button installUpdateButton;
     private Button openUpdateFolderButton;
+    private Button saveBrowserProfileButton;
     private CheckBox autoCheckUpdateOnStartupCheckBox;
     private CheckBox autoRunCheckBox;
+    private ComboBox<String> browserProfileComboBox;
     private Spinner<Integer> autoRunIntervalSpinner;
-    private TextField autoRunSpecificTimeField;
-    private RadioButton autoRunIntervalModeRadio;
-    private RadioButton autoRunSpecificTimeModeRadio;
+    private TextField autoRunStartTimeField;
+    private TextField autoRunStopTimeField;
+    private final List<CheckBox> autoRunDayChecks = new ArrayList<>();
     private Button autoRunSaveButton;
     private Label autoRunInfoLabel;
     private Label selectedFoldersLabel;
     private Label currentVersionLabel;
     private Label latestVersionLabel;
     private Label updateStatusLabel;
+    private Label updateDownloadProgressLabel;
+    private Label updateInstallProgressLabel;
     private TextField updateMetadataUrlField;
     private TextArea updateNotesArea;
-    private TextArea logArea;
+    private TableView<KeywordProgressRow> progressTableView;
+    private TableView<KeywordProgressRow> detailProgressTableView;
     private Label statusLabel;
     private Label loadedLabel;
     private Label successLabel;
@@ -132,20 +172,32 @@ public final class DownloaderFxApp extends Application {
 
     private final List<String> fullLogs = new ArrayList<>();
     private final List<String> failedKeywords = new ArrayList<>();
+    private final Set<String> failedKeywordSet = new LinkedHashSet<>();
     private final ObservableList<FolderItem> folderItems = FXCollections.observableArrayList();
+    private final ObservableList<KeywordProgressRow> progressRows = FXCollections.observableArrayList();
+    private final List<String> keywordOrder = new ArrayList<>();
+    private final Map<String, Integer> keywordIndexState = new LinkedHashMap<>();
+    private final Map<String, String> keywordFolderState = new LinkedHashMap<>();
     private final Map<String, String> keywordDownloadState = new LinkedHashMap<>();
     private final Map<String, String> keywordResultState = new LinkedHashMap<>();
+    private final Map<String, String> keywordMessageState = new LinkedHashMap<>();
+    private final Map<String, String> keywordStartTimeState = new LinkedHashMap<>();
+    private final Map<String, String> keywordEndTimeState = new LinkedHashMap<>();
     private int loadedKeywords;
     private int successCount;
     private int failCount;
     private boolean runningState;
-    private Task<RunStats> activeTask;
+    private Task<RunStats> activeDownloadTask;
     private String currentReportLink;
     private volatile boolean stopRequestedByUser;
     private volatile boolean stopRequestedByScheduler;
     private volatile boolean autoRestartAfterStop;
+    private volatile boolean activeRunAutoTriggered;
+    private volatile LocalDateTime lastAutoNoPendingAlertAt;
+    private volatile boolean autoNoPendingAlertShowing;
     private volatile LocalDateTime nextAutoRunAt;
     private UpdateInfo latestUpdateInfo;
+    private Path downloadedUpdatePath;
     private ScheduledExecutorService autoRunScheduler;
     private final AtomicBoolean folderChooserOpening = new AtomicBoolean(false);
     private final Map<FolderItem, ChangeListener<Boolean>> folderSelectionListeners = new IdentityHashMap<>();
@@ -156,12 +208,15 @@ public final class DownloaderFxApp extends Application {
         initComponents();
         setupLayout(stage);
         setupListeners();
+        Utils.setLogSink(this::handleRuntimeLog);
 
         stage.setTitle(AppInfo.APP_NAME);
         stage.setMinWidth(900);
         stage.setMinHeight(620);
+        stage.setMaximized(true);
         stage.show();
 
+        Platform.runLater(this::showInstallResultIfAny);
         Platform.runLater(this::checkUpdatesOnStartupIfEnabled);
     }
 
@@ -176,7 +231,7 @@ public final class DownloaderFxApp extends Application {
         selectedFoldersLabel.getStyleClass().add("folder-count-chip");
 
         addFolderButton = new Button("Add folders");
-        addFolderButton.getStyleClass().add("secondary-button");
+        addFolderButton.getStyleClass().add("outline-primary-button");
         addFolderButton.setOnAction(event -> handleAddFolders());
 
         deleteFolderButton = new Button("Delete");
@@ -192,28 +247,40 @@ public final class DownloaderFxApp extends Application {
         uncheckAllFoldersButton.setOnAction(event -> handleCheckAllFolders(false));
 
         autoRunCheckBox = new CheckBox("Enable auto run");
-        autoRunIntervalSpinner = new Spinner<>(30, 1440, 30, 30);
+        autoRunIntervalSpinner = new Spinner<>(1, 1440, 30, 1);
         autoRunIntervalSpinner.setEditable(true);
-        autoRunIntervalSpinner.setPrefWidth(110);
+        autoRunIntervalSpinner.setPrefWidth(115);
+        autoRunIntervalSpinner.setMinWidth(115);
+        autoRunIntervalSpinner.setMaxWidth(115);
 
-        autoRunSpecificTimeField = new TextField("08:00");
-        autoRunSpecificTimeField.setPromptText("HH:mm");
-        autoRunSpecificTimeField.setPrefWidth(90);
-        autoRunSpecificTimeField.textProperty().addListener((obs, oldVal, newVal) -> updateAutoRunTimeValidation());
+        autoRunStartTimeField = new TextField("08:00");
+        autoRunStartTimeField.setPromptText("HH:mm");
+        autoRunStartTimeField.setPrefWidth(115);
+        autoRunStartTimeField.setMinWidth(115);
+        autoRunStartTimeField.setMaxWidth(115);
+        autoRunStartTimeField.textProperty().addListener((obs, oldVal, newVal) -> updateAutoRunTimeValidation());
 
-        ToggleGroup autoRunModeGroup = new ToggleGroup();
-        autoRunIntervalModeRadio = new RadioButton("Interval");
-        autoRunIntervalModeRadio.setToggleGroup(autoRunModeGroup);
-        autoRunIntervalModeRadio.setSelected(true);
+        autoRunStopTimeField = new TextField("18:00");
+        autoRunStopTimeField.setPromptText("HH:mm");
+        autoRunStopTimeField.setPrefWidth(115);
+        autoRunStopTimeField.setMinWidth(115);
+        autoRunStopTimeField.setMaxWidth(115);
+        autoRunStopTimeField.textProperty().addListener((obs, oldVal, newVal) -> updateAutoRunTimeValidation());
 
-        autoRunSpecificTimeModeRadio = new RadioButton("Specific time");
-        autoRunSpecificTimeModeRadio.setToggleGroup(autoRunModeGroup);
-
-        autoRunIntervalModeRadio.selectedProperty().addListener((obs, oldVal, selected) -> refreshAutoRunModeUi());
-        autoRunSpecificTimeModeRadio.selectedProperty().addListener((obs, oldVal, selected) -> refreshAutoRunModeUi());
+        autoRunDayChecks.clear();
+        autoRunDayChecks.add(new CheckBox("Mon"));
+        autoRunDayChecks.add(new CheckBox("Tue"));
+        autoRunDayChecks.add(new CheckBox("Wed"));
+        autoRunDayChecks.add(new CheckBox("Thu"));
+        autoRunDayChecks.add(new CheckBox("Fri"));
+        autoRunDayChecks.add(new CheckBox("Sat"));
+        autoRunDayChecks.add(new CheckBox("Sun"));
+        autoRunDayChecks.forEach(cb -> cb.setSelected(true));
 
         autoRunSaveButton = new Button("Save schedule");
-        autoRunSaveButton.getStyleClass().add("secondary-button");
+        autoRunSaveButton.getStyleClass().add("outline-primary-button");
+        autoRunSaveButton.setPrefWidth(126);
+        autoRunSaveButton.setMinWidth(126);
         autoRunSaveButton.setOnAction(event -> handleSaveAutoRunConfig());
 
         autoRunInfoLabel = new Label("Auto run is OFF");
@@ -226,7 +293,7 @@ public final class DownloaderFxApp extends Application {
         reportField.setPromptText("Google Sheets link will appear here...");
         reportField.setEditable(false);
 
-        concurrencySpinner = new Spinner<>(1, 8, 2);
+        concurrencySpinner = new Spinner<>(1, 10, 2);
         concurrencySpinner.setEditable(true);
         concurrencySpinner.setPrefWidth(130);
 
@@ -255,6 +322,10 @@ public final class DownloaderFxApp extends Application {
         sheetsConfigButton.getStyleClass().add("secondary-button");
         sheetsConfigButton.setOnAction(event -> showGoogleSheetsConfigDialog());
 
+        testDownloadButton = new Button("Test file download");
+        testDownloadButton.getStyleClass().add("secondary-button");
+        testDownloadButton.setOnAction(event -> handleTestFileDownload());
+
         UpdateConfigStore.UpdateConfig updateConfig = UpdateConfigStore.load().normalized();
         updateMetadataUrlField = new TextField(defaultText(updateConfig.metadataUrl()));
         updateMetadataUrlField.setPromptText("https://.../latest.json");
@@ -268,8 +339,14 @@ public final class DownloaderFxApp extends Application {
         latestVersionLabel = new Label("Latest version: -");
         latestVersionLabel.getStyleClass().add("field-label");
 
-        updateStatusLabel = new Label("Configure latest.json URL to check updates.");
+        updateStatusLabel = new Label("");
         updateStatusLabel.getStyleClass().add("field-hint");
+
+        updateDownloadProgressLabel = new Label("Download: -");
+        updateDownloadProgressLabel.getStyleClass().add("field-hint");
+
+        updateInstallProgressLabel = new Label("Install: -");
+        updateInstallProgressLabel.getStyleClass().add("field-hint");
 
         updateNotesArea = new TextArea();
         updateNotesArea.setEditable(false);
@@ -291,13 +368,28 @@ public final class DownloaderFxApp extends Application {
         downloadUpdateButton.setDisable(true);
         downloadUpdateButton.setOnAction(event -> handleDownloadUpdate());
 
+        installUpdateButton = new Button("Install update");
+        installUpdateButton.getStyleClass().add("secondary-button");
+        installUpdateButton.setDisable(true);
+        installUpdateButton.setOnAction(event -> handleInstallUpdate());
+
         openUpdateFolderButton = new Button("Open update folder");
         openUpdateFolderButton.getStyleClass().add("secondary-button");
         openUpdateFolderButton.setOnAction(event -> handleOpenUpdateFolder());
 
-        viewLogButton = new Button("View detailed logs");
+        browserProfileComboBox = new ComboBox<>();
+        browserProfileComboBox.getItems().addAll("Visible (Chrome window)", "Hidden (headless)");
+        browserProfileComboBox.setPrefWidth(220);
+        loadBrowserProfileConfig();
+
+        saveBrowserProfileButton = new Button("Save browser mode");
+        saveBrowserProfileButton.getStyleClass().add("secondary-button");
+        saveBrowserProfileButton.setOnAction(event -> handleSaveBrowserProfileConfig());
+
+
+        viewLogButton = new Button("View app log");
         viewLogButton.getStyleClass().add("secondary-button");
-        viewLogButton.setDisable(true);
+        viewLogButton.setDisable(false);
         viewLogButton.setOnAction(event -> showLogDetails());
 
         expandProgressButton = new Button("⤢");
@@ -308,22 +400,19 @@ public final class DownloaderFxApp extends Application {
         statusLabel.getStyleClass().add("status-idle");
 
         loadedLabel = new Label();
-        loadedLabel.getStyleClass().add("field-label");
+        loadedLabel.getStyleClass().addAll("badge", "badge-blue");
         successLabel = new Label();
-        successLabel.getStyleClass().add("field-label");
+        successLabel.getStyleClass().addAll("badge", "badge-green");
         failedLabel = new Label();
-        failedLabel.getStyleClass().add("field-label");
+        failedLabel.getStyleClass().addAll("badge", "badge-red");
 
         progressIndicator = new ProgressIndicator();
         progressIndicator.setVisible(false);
         progressIndicator.setManaged(false);
         progressIndicator.setPrefSize(26, 26);
 
-        logArea = new TextArea();
-        logArea.setEditable(false);
-        logArea.setWrapText(true);
-        logArea.setPromptText("Progress will appear here while running...");
-        VBox.setVgrow(logArea, Priority.ALWAYS);
+        progressTableView = createProgressTable(false);
+        VBox.setVgrow(progressTableView, Priority.ALWAYS);
         resetProgressCounters();
         refreshProgressView();
         updateReportFromConfig();
@@ -341,18 +430,21 @@ public final class DownloaderFxApp extends Application {
 
         Label logTitle = new Label("Progress");
         logTitle.getStyleClass().add("section-title");
+        
+        HBox statsBar = new HBox(12, loadedLabel, successLabel, failedLabel);
+        statsBar.setAlignment(Pos.CENTER_LEFT);
+        
         Region logSpacer = new Region();
         HBox.setHgrow(logSpacer, Priority.ALWAYS);
-        HBox logHeader = new HBox(10, logTitle, logSpacer, expandProgressButton, viewLogButton);
+        
+        HBox logHeader = new HBox(20, logTitle, statsBar, logSpacer, viewLogButton, expandProgressButton);
         logHeader.setAlignment(Pos.CENTER_LEFT);
 
-        HBox statsBar = new HBox(24, loadedLabel, successLabel, failedLabel);
-        statsBar.setAlignment(Pos.CENTER_LEFT);
-
-        VBox logCard = new VBox(10, logHeader, statsBar, logArea);
+        VBox logCard = new VBox(12, logHeader, progressTableView);
         logCard.getStyleClass().add("card-panel");
 
         VBox rightColumn = new VBox(12, controlCard);
+        VBox.setVgrow(controlCard, Priority.ALWAYS);
         rightColumn.getStyleClass().add("side-column");
 
         SplitPane workspace = new SplitPane(folderCard, rightColumn);
@@ -362,7 +454,12 @@ public final class DownloaderFxApp extends Application {
         rightColumn.setMaxWidth(Double.MAX_VALUE);
 
         VBox downloadContent = new VBox(14, workspace, logCard);
-        Tab downloadTab = new Tab("Download", downloadContent);
+        downloadContent.setMinHeight(650);
+        ScrollPane downloadScroll = new ScrollPane(downloadContent);
+        downloadScroll.setFitToWidth(true);
+        downloadScroll.setFitToHeight(true);
+        downloadScroll.setStyle("-fx-background-color: transparent;");
+        Tab downloadTab = new Tab("Download", downloadScroll);
         downloadTab.setClosable(false);
 
         VBox reportContent = new VBox(reportCard);
@@ -370,10 +467,20 @@ public final class DownloaderFxApp extends Application {
         VBox.setVgrow(reportCard, Priority.ALWAYS);
         reportCard.setMaxWidth(Double.MAX_VALUE);
         reportCard.setMaxHeight(Double.MAX_VALUE);
-        Tab reportTab = new Tab("Report", reportContent);
+        reportContent.setMinHeight(300);
+        ScrollPane reportScroll = new ScrollPane(reportContent);
+        reportScroll.setFitToWidth(true);
+        reportScroll.setFitToHeight(true);
+        reportScroll.setStyle("-fx-background-color: transparent;");
+        Tab reportTab = new Tab("Report", reportScroll);
         reportTab.setClosable(false);
 
-        Tab settingsTab = new Tab("Settings", settingsCard);
+        settingsCard.setMinHeight(500);
+        ScrollPane settingsScroll = new ScrollPane(settingsCard);
+        settingsScroll.setFitToWidth(true);
+        settingsScroll.setFitToHeight(true);
+        settingsScroll.setStyle("-fx-background-color: transparent;");
+        Tab settingsTab = new Tab("Settings", settingsScroll);
         settingsTab.setClosable(false);
 
         TabPane tabPane = new TabPane(downloadTab, reportTab, settingsTab);
@@ -393,7 +500,7 @@ public final class DownloaderFxApp extends Application {
     }
 
     private VBox buildHeaderPanel() {
-        Label title = new Label(AppInfo.APP_NAME);
+        Label title = new Label(AppInfo.APP_NAME + " v" + AppInfo.VERSION);
         title.getStyleClass().add("screen-title");
 
         Label statusCaption = new Label("Status:");
@@ -418,6 +525,7 @@ public final class DownloaderFxApp extends Application {
         VBox folderSection = buildFolderSection();
 
         VBox card = new VBox(10, title, folderSection);
+        VBox.setVgrow(folderSection, Priority.ALWAYS);
         card.getStyleClass().add("card-panel");
         return card;
     }
@@ -447,6 +555,7 @@ public final class DownloaderFxApp extends Application {
         VBox autoRunBar = buildAutoRunBar();
 
         VBox card = new VBox(12, title, topBar, actionButtons, new Separator(), autoRunBar);
+        VBox.setVgrow(autoRunBar, Priority.ALWAYS);
         card.getStyleClass().add("card-panel");
         return card;
     }
@@ -455,26 +564,33 @@ public final class DownloaderFxApp extends Application {
         Label title = new Label("Settings");
         title.getStyleClass().add("section-title");
 
-        Label hint = new Label("Configure integrations and manage local run data.");
-        hint.getStyleClass().add("field-hint");
-
         Label maintenanceTitle = new Label("Maintenance");
         maintenanceTitle.getStyleClass().add("field-label");
 
-        Label maintenanceHint = new Label("Manage Google Sheets connection and reset local run state when needed.");
-        maintenanceHint.getStyleClass().add("field-hint");
-
-        HBox actions = new HBox(10, sheetsConfigButton, clearStateButton);
+        HBox actions = new HBox(10, sheetsConfigButton, clearStateButton, testDownloadButton);
         actions.setAlignment(Pos.CENTER_LEFT);
         actions.getStyleClass().add("settings-actions");
 
-        VBox maintenanceCard = new VBox(8, maintenanceTitle, maintenanceHint, actions);
+        Label browserTitle = new Label("Browser mode");
+        browserTitle.getStyleClass().add("field-label");
+
+        HBox browserRow = new HBox(10, browserProfileComboBox, saveBrowserProfileButton);
+        browserRow.setAlignment(Pos.CENTER_LEFT);
+
+        VBox maintenanceCard = new VBox(
+            8,
+            maintenanceTitle,
+            actions,
+            new Separator(),
+            browserTitle,
+            browserRow
+        );
         maintenanceCard.getStyleClass().add("settings-group");
 
         VBox updatesCard = buildUpdatesSection();
         updatesCard.getStyleClass().add("settings-group");
 
-        VBox box = new VBox(12, title, hint, maintenanceCard, updatesCard);
+        VBox box = new VBox(12, title, maintenanceCard, updatesCard);
         box.getStyleClass().add("card-panel");
         box.getStyleClass().add("settings-root");
         return box;
@@ -487,17 +603,28 @@ public final class DownloaderFxApp extends Application {
         Label urlLabel = new Label("latest.json URL");
         urlLabel.getStyleClass().add("field-label");
 
-        HBox urlRow = new HBox(10, urlLabel, updateMetadataUrlField, saveUpdateConfigButton);
+        HBox urlRow = new HBox(10, updateMetadataUrlField, saveUpdateConfigButton);
         HBox.setHgrow(updateMetadataUrlField, Priority.ALWAYS);
         urlRow.setAlignment(Pos.CENTER_LEFT);
 
         HBox versionRow = new HBox(18, currentVersionLabel, latestVersionLabel);
         versionRow.setAlignment(Pos.CENTER_LEFT);
 
-        HBox actionRow = new HBox(10, checkUpdateButton, downloadUpdateButton, openUpdateFolderButton);
+        HBox actionRow = new HBox(10, checkUpdateButton, downloadUpdateButton, installUpdateButton, openUpdateFolderButton);
         actionRow.setAlignment(Pos.CENTER_LEFT);
 
-        VBox box = new VBox(9, title, urlRow, autoCheckUpdateOnStartupCheckBox, versionRow, updateStatusLabel, updateNotesArea, actionRow);
+        VBox box = new VBox(
+            9,
+            title,
+            urlLabel,
+            urlRow,
+            autoCheckUpdateOnStartupCheckBox,
+            versionRow,
+            updateStatusLabel,
+            updateDownloadProgressLabel,
+            updateNotesArea,
+            actionRow
+        );
         return box;
     }
 
@@ -524,7 +651,7 @@ public final class DownloaderFxApp extends Application {
         Region actionSpacer = new Region();
         HBox.setHgrow(actionSpacer, Priority.ALWAYS);
         HBox actions = new HBox(8, actionSpacer, checkAllFoldersButton, uncheckAllFoldersButton, deleteFolderButton, addFolderButton);
-        actions.setAlignment(Pos.CENTER_LEFT);
+        actions.setAlignment(Pos.CENTER_RIGHT);
 
         VBox box = new VBox(8, titleRow, folderListView, actions);
         VBox.setVgrow(folderListView, Priority.ALWAYS);
@@ -544,36 +671,59 @@ public final class DownloaderFxApp extends Application {
         Label intervalLabel = new Label("Every (minutes)");
         intervalLabel.getStyleClass().add("field-label");
 
-        Label specificTimeLabel = new Label("Run at (HH:mm)");
-        specificTimeLabel.getStyleClass().add("field-label");
+        Label startTimeLabel = new Label("Start (HH:mm)");
+        startTimeLabel.getStyleClass().add("field-label");
 
-        HBox modeRow = new HBox(14,
-            autoRunCheckBox,
-            autoRunIntervalModeRadio,
-            autoRunSpecificTimeModeRadio
-        );
+        Label stopTimeLabel = new Label("Stop (HH:mm)");
+        stopTimeLabel.getStyleClass().add("field-label");
+
+        HBox modeRow = new HBox(14, autoRunCheckBox);
         modeRow.getStyleClass().add("autorun-row");
         modeRow.setAlignment(Pos.CENTER_LEFT);
 
-        Region spacer = new Region();
-        HBox.setHgrow(spacer, Priority.ALWAYS);
+        GridPane scheduleGrid = new GridPane();
+        scheduleGrid.setHgap(20);
+        scheduleGrid.setVgap(8);
+        
+        javafx.scene.layout.ColumnConstraints colConstraints = new javafx.scene.layout.ColumnConstraints();
+        colConstraints.setPrefWidth(115);
+        colConstraints.setMinWidth(115);
+        colConstraints.setMaxWidth(115);
+        scheduleGrid.getColumnConstraints().addAll(colConstraints, colConstraints, colConstraints);
 
-        HBox configRow = new HBox(10,
-            intervalLabel,
-            autoRunIntervalSpinner,
-            specificTimeLabel,
-            autoRunSpecificTimeField,
-            spacer,
-            autoRunSaveButton
-        );
-        configRow.getStyleClass().add("autorun-row");
-        configRow.setAlignment(Pos.CENTER_LEFT);
+        scheduleGrid.add(intervalLabel, 0, 0);
+        scheduleGrid.add(startTimeLabel, 1, 0);
+        scheduleGrid.add(stopTimeLabel, 2, 0);
+        scheduleGrid.add(autoRunIntervalSpinner, 0, 1);
+        scheduleGrid.add(autoRunStartTimeField, 1, 1);
+        scheduleGrid.add(autoRunStopTimeField, 2, 1);
+
+        HBox gridRow = new HBox(scheduleGrid);
+        gridRow.getStyleClass().add("autorun-row");
+        gridRow.setAlignment(Pos.CENTER_LEFT);
+
+        HBox saveRow = new HBox(autoRunSaveButton);
+        saveRow.getStyleClass().add("autorun-row");
+        saveRow.setAlignment(Pos.CENTER_LEFT);
 
         HBox infoRow = new HBox(autoRunInfoLabel);
         infoRow.getStyleClass().add("autorun-info-row");
         infoRow.setAlignment(Pos.CENTER_LEFT);
 
-        VBox box = new VBox(8, modeRow, configRow, infoRow);
+        Label daysLabel = new Label("Days");
+        daysLabel.getStyleClass().add("field-label");
+        HBox daysTitleRow = new HBox(daysLabel);
+        daysTitleRow.getStyleClass().add("autorun-row");
+        daysTitleRow.setAlignment(Pos.CENTER_LEFT);
+
+        FlowPane daysRow = new FlowPane(16, 8);
+        daysRow.getChildren().addAll(autoRunDayChecks);
+        daysRow.getStyleClass().add("autorun-row");
+
+        Region spacer = new Region();
+        VBox.setVgrow(spacer, Priority.ALWAYS);
+
+        VBox box = new VBox(8, modeRow, infoRow, gridRow, daysTitleRow, daysRow, spacer, saveRow);
         box.getStyleClass().add("autorun-box");
         return box;
     }
@@ -584,7 +734,7 @@ public final class DownloaderFxApp extends Application {
     }
 
     private void startDownload(boolean autoTriggered) {
-        if (activeTask != null) {
+        if (activeDownloadTask != null) {
             if (autoTriggered) {
                 autoRestartAfterStop = true;
                 updateStatus("Auto-run queued", "status-running");
@@ -595,7 +745,7 @@ public final class DownloaderFxApp extends Application {
 
         stopRequestedByUser = false;
         stopRequestedByScheduler = false;
-        logArea.clear();
+        activeRunAutoTriggered = autoTriggered;
         clearRunData();
         refreshProgressView();
 
@@ -608,22 +758,21 @@ public final class DownloaderFxApp extends Application {
             return;
         }
 
+        int concurrency = normalizeConcurrency(concurrencySpinner.getValue());
+        concurrencySpinner.getValueFactory().setValue(concurrency);
+        ensureChromeProfilesForConcurrency(concurrency);
+
         updateStatus(autoTriggered ? "Running (auto)..." : "Running...", "status-running");
-        setRunningState(true);
+        setDownloadRunningState(true);
 
         Task<RunStats> task = new Task<>() {
             @Override
             protected RunStats call() {
-                Utils.setLogSink(DownloaderFxApp.this::handleRuntimeLog);
-                try {
-                    return DownloadCoordinator.run(
-                        rootPaths,
-                        concurrencySpinner.getValue(),
-                        false
-                    );
-                } finally {
-                    Utils.clearLogSink();
-                }
+                return DownloadCoordinator.run(
+                    rootPaths,
+                    concurrency,
+                    false
+                );
             }
         };
 
@@ -636,16 +785,21 @@ public final class DownloaderFxApp extends Application {
                 successCount = stats.getSuccessCount();
                 failCount = stats.getFailCount();
                 failedKeywords.clear();
+                failedKeywordSet.clear();
                 for (RunStats.FailureRecord failure : stats.getFailures()) {
                     failedKeywords.add(failure.keyword() + " | " + failure.reason());
+                    if (failure.keyword() != null && !failure.keyword().isBlank()) {
+                        failedKeywordSet.add(failure.keyword());
+                    }
                 }
+                failCount = failedKeywordSet.size();
                 addDetailLog(String.format("=== COMPLETED === Success: %d | Failed: %d | Total: %d",
                     successCount, failCount, loadedKeywords));
                 updateStatus("Completed", "status-success");
                 updateReportFromConfig();
             }
             refreshProgressView();
-            finishTask();
+            finishDownloadTask();
         });
 
         task.setOnFailed(event -> {
@@ -653,22 +807,22 @@ public final class DownloaderFxApp extends Application {
             if (task.isCancelled() || stopRequestedByUser || stopRequestedByScheduler) {
                 applyStoppedStateMessage();
             } else if (isAllKeywordsCompletedError(err)) {
-                handleAllKeywordsCompletedNotice();
+                handleAllKeywordsCompletedNotice(activeRunAutoTriggered);
             } else {
                 updateStatus("Run failed", "status-error");
                 addDetailLog("Error: " + (err != null ? err.getMessage() : "Unknown"));
             }
             refreshProgressView();
-            finishTask();
+            finishDownloadTask();
         });
 
         task.setOnCancelled(event -> {
             applyStoppedStateMessage();
             refreshProgressView();
-            finishTask();
+            finishDownloadTask();
         });
 
-        activeTask = task;
+        activeDownloadTask = task;
 
         Thread worker = new Thread(task, "Downloader-Worker");
         worker.setDaemon(true);
@@ -683,12 +837,38 @@ public final class DownloaderFxApp extends Application {
         return message.contains("already completed") || message.contains("all selected keywords");
     }
 
-    private void handleAllKeywordsCompletedNotice() {
+    private void handleAllKeywordsCompletedNotice(boolean autoTriggered) {
         updateStatus("All keywords completed", "status-success");
         addDetailLog("All selected keywords have already been downloaded in previous runs.");
         addDetailLog("No pending keyword remains for this run.");
         addDetailLog("If you want to run again, use 'Clear run state' in Settings.");
 
+        if (autoTriggered) {
+            LocalDateTime now = LocalDateTime.now();
+            if (autoNoPendingAlertShowing) {
+                addDetailLog("Auto run: no-pending popup is already showing. Skip duplicate popup.");
+                return;
+            }
+            if (lastAutoNoPendingAlertAt != null
+                && Duration.between(lastAutoNoPendingAlertAt, now).toMinutes() < 10) {
+                addDetailLog("Auto run: no-pending popup suppressed (cooldown 10 minutes).");
+                return;
+            }
+
+            autoNoPendingAlertShowing = true;
+            try {
+                showNoPendingKeywordsAlert();
+                lastAutoNoPendingAlertAt = LocalDateTime.now();
+            } finally {
+                autoNoPendingAlertShowing = false;
+            }
+            return;
+        }
+
+        showNoPendingKeywordsAlert();
+    }
+
+    private void showNoPendingKeywordsAlert() {
         Alert alert = new Alert(Alert.AlertType.INFORMATION);
         alert.initOwner(ownerStage);
         alert.setTitle("No pending keywords");
@@ -698,15 +878,15 @@ public final class DownloaderFxApp extends Application {
     }
 
     private void handleStopDownload() {
-        if (activeTask == null) {
+        if (activeDownloadTask == null) {
             return;
         }
         stopRequestedByUser = true;
         stopRequestedByScheduler = false;
         autoRestartAfterStop = false;
         stopButton.setDisable(true);
-        updateStatus("Stopping...", "status-running");
-        addDetailLog("Stop requested...");
+        updateStatus("Stopping download...", "status-running");
+        addDetailLog("Download stop requested...");
         DownloadCoordinator.requestStop();
     }
 
@@ -754,6 +934,241 @@ public final class DownloaderFxApp extends Application {
         }
     }
 
+    private void handleTestFileDownload() {
+        TextInputDialog dialog = new TextInputDialog("ae74ffdf-f2df-4e84-9390-b38a84b85c7e");
+        dialog.initOwner(ownerStage);
+        dialog.setTitle("Test file download");
+        dialog.setHeaderText("Enter file id, field=..., fileId=..., or a full download URL");
+        dialog.setContentText("File id / URL:");
+
+        Optional<String> input = dialog.showAndWait();
+        if (input.isEmpty()) {
+            return;
+        }
+
+        String fileInput = input.get().trim();
+        if (fileInput.isBlank()) {
+            updateStatus("Test download failed", "status-error");
+            addDetailLog("Test download failed: file id is required.");
+            return;
+        }
+
+        testDownloadButton.setDisable(true);
+        updateStatus("Testing download...", "status-running");
+        addDetailLog("Test download: requesting file " + fileInput);
+
+        Task<Path> task = new Task<>() {
+            @Override
+            protected Path call() throws Exception {
+                return downloadTestFile(fileInput);
+            }
+        };
+
+        task.setOnSucceeded(event -> {
+            Path downloaded = task.getValue();
+            updateStatus("Test download OK", "status-success");
+            addDetailLog("Test download OK: " + downloaded + " (" + humanBytesSafe(downloaded) + ")");
+            testDownloadButton.setDisable(runningState);
+        });
+
+        task.setOnFailed(event -> {
+            Throwable ex = task.getException();
+            String message = ex == null ? "Unknown" : ex.getMessage();
+            updateStatus("Test download failed", "status-error");
+            addDetailLog("Test download failed: " + message);
+            showTestDownloadError(message);
+            testDownloadButton.setDisable(runningState);
+        });
+
+        Thread worker = new Thread(task, "Test-File-Download-Worker");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private Path downloadTestFile(String input) throws Exception {
+        List<String> urls = buildTestDownloadUrls(input);
+        Exception lastError = null;
+        for (String url : urls) {
+            try {
+                return downloadTestFileFromUrl(url, input);
+            } catch (Exception ex) {
+                lastError = ex;
+                addDetailLog("Test download attempt failed: " + url + " | " + ex.getMessage());
+            }
+        }
+        throw lastError == null ? new IOException("No download URL generated.") : lastError;
+    }
+
+    private Path downloadTestFileFromUrl(String url, String input) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(url))
+            .timeout(Duration.ofSeconds(60))
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Origin", "https://muasamcong.mpi.gov.vn")
+            .header("Referer", "https://muasamcong.mpi.gov.vn/")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .GET()
+            .build();
+
+        HttpResponse<byte[]> response = TEST_DOWNLOAD_HTTP_CLIENT.send(
+            request,
+            HttpResponse.BodyHandlers.ofByteArray()
+        );
+
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            String body = new String(response.body(), StandardCharsets.UTF_8);
+            throw new IOException("HTTP " + response.statusCode() + ": " + trimForLog(body));
+        }
+
+        byte[] body = response.body();
+        if (body == null || body.length == 0) {
+            throw new IOException("empty response body");
+        }
+
+        Path folder = Utils.dataDirectory().resolve("test-downloads").toAbsolutePath().normalize();
+        Utils.ensureDirectory(folder);
+
+        String fileName = response.headers()
+            .firstValue("Content-Disposition")
+            .map(this::fileNameFromContentDisposition)
+            .filter(name -> !name.isBlank())
+            .orElse("test-download-" + normalizedFileId(input) + guessExtension(response, body));
+
+        Path target = uniquePath(folder.resolve(sanitizeFileNameKeepExtension(fileName)));
+        Files.write(target, body);
+        return target;
+    }
+
+    private List<String> buildTestDownloadUrls(String input) {
+        String trimmed = input == null ? "" : input.trim();
+        if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+            return List.of(trimmed);
+        }
+
+        String value = trimmed;
+        String explicitParam = null;
+        int equalsIndex = trimmed.indexOf('=');
+        if (equalsIndex > 0 && equalsIndex < trimmed.length() - 1) {
+            explicitParam = trimmed.substring(0, equalsIndex).trim();
+            value = trimmed.substring(equalsIndex + 1).trim();
+        }
+
+        String encodedValue = URLEncoder.encode(value, StandardCharsets.UTF_8);
+        if ("field".equalsIgnoreCase(explicitParam) || "fileId".equalsIgnoreCase(explicitParam)) {
+            return List.of(TEST_DOWNLOAD_ENDPOINT + "?" + explicitParam + "=" + encodedValue);
+        }
+        return List.of(
+            TEST_DOWNLOAD_ENDPOINT + "?field=" + encodedValue,
+            TEST_DOWNLOAD_ENDPOINT + "?fileId=" + encodedValue
+        );
+    }
+
+    private void showTestDownloadError(String message) {
+        Alert alert = new Alert(Alert.AlertType.ERROR);
+        alert.initOwner(ownerStage);
+        alert.setTitle("Test download failed");
+        alert.setHeaderText("Unable to download the test file.");
+        alert.setContentText(message == null || message.isBlank() ? "Unknown error" : message);
+        alert.show();
+    }
+
+    private String normalizedFileId(String input) {
+        if (input == null || input.isBlank()) {
+            return "file";
+        }
+        String value = input.trim();
+        int equalsIndex = value.indexOf('=');
+        if (equalsIndex > 0 && equalsIndex < value.length() - 1) {
+            value = value.substring(equalsIndex + 1).trim();
+        }
+        int queryIndex = value.indexOf('?');
+        if (queryIndex >= 0 && queryIndex < value.length() - 1) {
+            value = value.substring(queryIndex + 1);
+        }
+        return Utils.sanitizeFileName(value);
+    }
+
+    private String sanitizeFileNameKeepExtension(String fileName) {
+        String value = fileName == null || fileName.isBlank() ? "download.bin" : fileName.trim();
+        int dotIndex = value.lastIndexOf('.');
+        if (dotIndex <= 0 || dotIndex == value.length() - 1) {
+            return Utils.sanitizeFileName(value);
+        }
+        String base = Utils.sanitizeFileName(value.substring(0, dotIndex));
+        String extension = value.substring(dotIndex).replaceAll("[^A-Za-z0-9.]", "");
+        if (extension.isBlank() || extension.length() > 10) {
+            extension = ".bin";
+        }
+        return base + extension;
+    }
+
+    private String fileNameFromContentDisposition(String contentDisposition) {
+        if (contentDisposition == null || contentDisposition.isBlank()) {
+            return "";
+        }
+        Matcher matcher = Pattern.compile("filename\\*?=([^;]+)").matcher(contentDisposition);
+        if (!matcher.find()) {
+            return "";
+        }
+
+        String value = matcher.group(1).trim();
+        if (value.regionMatches(true, 0, "UTF-8''", 0, 7)) {
+            value = value.substring(7);
+        }
+        value = value.replaceAll("^\"|\"$", "");
+        return URLDecoder.decode(value, StandardCharsets.UTF_8);
+    }
+
+    private String guessExtension(HttpResponse<byte[]> response, byte[] body) {
+        String contentType = response.headers().firstValue("Content-Type").orElse("").toLowerCase();
+        if (contentType.contains("pdf") || startsWith(body, '%', 'P', 'D', 'F')) {
+            return ".pdf";
+        }
+        if (startsWith(body, 'P', 'K')) {
+            return ".zip";
+        }
+        return ".bin";
+    }
+
+    private boolean startsWith(byte[] body, char... chars) {
+        if (body == null || body.length < chars.length) {
+            return false;
+        }
+        for (int i = 0; i < chars.length; i++) {
+            if ((body[i] & 0xff) != chars[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Path uniquePath(Path target) {
+        if (!Files.exists(target)) {
+            return target;
+        }
+
+        String fileName = target.getFileName().toString();
+        int dot = fileName.lastIndexOf('.');
+        String base = dot > 0 ? fileName.substring(0, dot) : fileName;
+        String ext = dot > 0 ? fileName.substring(dot) : "";
+        Path parent = target.getParent();
+        int suffix = 1;
+        Path candidate;
+        do {
+            candidate = parent.resolve(base + "_" + suffix + ext);
+            suffix++;
+        } while (Files.exists(candidate));
+        return candidate;
+    }
+
+    private String trimForLog(String value) {
+        if (value == null || value.isBlank()) {
+            return "empty response";
+        }
+        String normalized = value.replaceAll("\\s+", " ").trim();
+        return normalized.length() > 300 ? normalized.substring(0, 300) + "..." : normalized;
+    }
+
     private void handleCheckForUpdates() {
         handleCheckForUpdates(false);
     }
@@ -771,6 +1186,8 @@ public final class DownloaderFxApp extends Application {
         if (!silent) {
             setUpdateStatus("Checking for updates...", false);
         }
+        updateDownloadProgressLabel.setText("Download: -");
+        updateInstallProgressLabel.setText("Install: -");
         updateNotesArea.clear();
 
         Task<UpdateInfo> task = new Task<>() {
@@ -786,10 +1203,12 @@ public final class DownloaderFxApp extends Application {
 
         task.setOnSucceeded(event -> {
             latestUpdateInfo = task.getValue();
+            downloadedUpdatePath = null;
             latestVersionLabel.setText("Latest version: " + latestUpdateInfo.version());
             updateNotesArea.setText(buildUpdateNotes(latestUpdateInfo));
             boolean newer = UpdateService.isNewerVersion(latestUpdateInfo.version(), AppInfo.VERSION);
             downloadUpdateButton.setDisable(!newer);
+            installUpdateButton.setDisable(true);
             if (newer) {
                 setUpdateStatus("New version available.", false);
                 if (silent) {
@@ -804,7 +1223,9 @@ public final class DownloaderFxApp extends Application {
         task.setOnFailed(event -> {
             Throwable ex = task.getException();
             latestUpdateInfo = null;
+            downloadedUpdatePath = null;
             downloadUpdateButton.setDisable(true);
+            installUpdateButton.setDisable(true);
             if (!silent) {
                 setUpdateStatus("Check update failed: " + (ex == null ? "Unknown" : ex.getMessage()), true);
             }
@@ -857,20 +1278,41 @@ public final class DownloaderFxApp extends Application {
         Task<Path> task = new Task<>() {
             @Override
             protected Path call() throws Exception {
-                return UpdateService.downloadUpdate(latestUpdateInfo);
+                updateMessage("Download: starting...");
+                return UpdateService.downloadUpdate(latestUpdateInfo, (downloaded, total) -> {
+                    if (total > 0) {
+                        double percent = (downloaded * 100.0) / total;
+                        updateMessage(String.format(
+                            "Download: %.1f%% (%s / %s)",
+                            percent,
+                            humanBytes(downloaded),
+                            humanBytes(total)
+                        ));
+                    } else {
+                        updateMessage("Download: " + humanBytes(downloaded));
+                    }
+                });
             }
         };
 
+        task.messageProperty().addListener((obs, oldVal, newVal) -> {
+            if (newVal != null && !newVal.isBlank()) {
+                updateDownloadProgressLabel.setText(newVal);
+            }
+        });
+
         task.setOnSucceeded(event -> {
             Path downloadedUpdatePath = task.getValue();
-            setUpdateStatus("Downloaded: " + downloadedUpdatePath, false);
+            this.downloadedUpdatePath = downloadedUpdatePath;
+            setUpdateStatus("Downloaded. Click Install update to apply.", false);
+            updateDownloadProgressLabel.setText("Download: 100% (" + humanBytesSafe(downloadedUpdatePath) + ")");
             setUpdateControlsDisabled(false);
-            openDownloadedUpdate(downloadedUpdatePath);
         });
 
         task.setOnFailed(event -> {
             Throwable ex = task.getException();
             setUpdateStatus("Download failed: " + (ex == null ? "Unknown" : ex.getMessage()), true);
+            updateDownloadProgressLabel.setText("Download: failed");
             setUpdateControlsDisabled(false);
         });
 
@@ -886,6 +1328,94 @@ public final class DownloaderFxApp extends Application {
             Desktop.getDesktop().open(folder.toFile());
         } catch (Exception ex) {
             setUpdateStatus("Open update folder failed: " + ex.getMessage(), true);
+        }
+    }
+
+    private void handleInstallUpdate() {
+        if (downloadedUpdatePath == null || !Files.exists(downloadedUpdatePath)) {
+            setUpdateStatus("Download update first.", true);
+            return;
+        }
+
+        try {
+            updateInstallProgressLabel.setText("Install: 25% - preparing installer");
+            Path appDir = Path.of(System.getProperty("user.dir", ".")).toAbsolutePath().normalize();
+            Path launcherFile = appDir.resolve("MuaSamCong Downloader.exe");
+            if (!Files.exists(launcherFile)) {
+                setUpdateStatus("Install is supported only in packaged app folder.", true);
+                return;
+            }
+            Path updaterDir = Path.of(System.getProperty("java.io.tmpdir"), "muasamcong-updater")
+                .toAbsolutePath()
+                .normalize();
+            Utils.ensureDirectory(updaterDir);
+
+            Path packageCopyPath = updaterDir.resolve("update-package-" + System.currentTimeMillis() + ".zip");
+            Files.copy(downloadedUpdatePath, packageCopyPath, StandardCopyOption.REPLACE_EXISTING);
+
+            String scriptName = "install-update-" + System.currentTimeMillis() + ".ps1";
+            Path scriptPath = updaterDir.resolve(scriptName);
+            Path appParent = appDir.getParent();
+            if (appParent == null) {
+                throw new IllegalStateException("Cannot determine app parent folder.");
+            }
+
+            String appFolderName = appDir.getFileName().toString();
+            Path launcherTarget = appParent.resolve(appFolderName).resolve("MuaSamCong Downloader.exe");
+            String launcherPath = launcherTarget.toString();
+            Path resultFile = installResultFile();
+            Path logFile = installLogFile();
+
+            String script = String.join(System.lineSeparator(),
+                "$ErrorActionPreference = \"Stop\"",
+                "$zip = '" + toPsSingleQuoted(packageCopyPath.toString()) + "'",
+                "$appParent = '" + toPsSingleQuoted(appParent.toString()) + "'",
+                "$appFolderName = '" + toPsSingleQuoted(appFolderName) + "'",
+                "$launcher = '" + toPsSingleQuoted(launcherPath) + "'",
+                "$resultFile = '" + toPsSingleQuoted(resultFile.toString()) + "'",
+                "$logFile = '" + toPsSingleQuoted(logFile.toString()) + "'",
+                "if (Test-Path $resultFile) { Remove-Item $resultFile -Force }",
+                "Start-Sleep -Seconds 2",
+                "try {",
+                "  \"[$(Get-Date -Format s)] Start install. zip=$zip\" | Out-File -FilePath $logFile -Encoding UTF8 -Append",
+                "  Get-Process -Name 'MuaSamCong Downloader','java','javaw' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue",
+                "  Start-Sleep -Seconds 1",
+                "  $dest = Join-Path $appParent $appFolderName",
+                "  $stage = Join-Path $appParent ('_update_staging_' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())",
+                "  if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }",
+                "  Expand-Archive -Path $zip -DestinationPath $stage -Force",
+                "  if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }",
+                "  robocopy $stage $dest /MIR /R:5 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null",
+                "  $rc = $LASTEXITCODE",
+                "  if ($rc -ge 8) { throw \"robocopy failed with code $rc\" }",
+                "  Remove-Item $stage -Recurse -Force",
+                "  Get-ChildItem -Path $appParent -Directory | Where-Object { $_.Name -like 'MuaSamCong-Downloader-*-win' } | ForEach-Object {",
+                "    try { Remove-Item $_.FullName -Recurse -Force } catch { \"[$(Get-Date -Format s)] Cleanup warning: $($_.FullName) :: $($_.Exception.Message)\" | Out-File -FilePath $logFile -Encoding UTF8 -Append }",
+                "  }",
+                "  \"SUCCESS|Installed $(Get-Date -Format s)\" | Out-File -FilePath $resultFile -Encoding UTF8 -Force",
+                "  \"[$(Get-Date -Format s)] Install success\" | Out-File -FilePath $logFile -Encoding UTF8 -Append",
+                "  Start-Process -FilePath $launcher",
+                "} catch {",
+                "  \"FAILED|$($_.Exception.Message)\" | Out-File -FilePath $resultFile -Encoding UTF8 -Force",
+                "  \"[$(Get-Date -Format s)] Install failed: $($_.Exception.Message)\" | Out-File -FilePath $logFile -Encoding UTF8 -Append",
+                "}"
+            ) + System.lineSeparator();
+
+            Files.writeString(scriptPath, script, StandardCharsets.UTF_8);
+            updateInstallProgressLabel.setText("Install: 50% - launching installer");
+
+            new ProcessBuilder(
+                "powershell",
+                "-ExecutionPolicy", "Bypass",
+                "-File", scriptPath.toString()
+            ).start();
+
+            updateInstallProgressLabel.setText("Install: 75% - closing app");
+            setUpdateStatus("Installing update and restarting app...", false);
+            Platform.exit();
+        } catch (Exception ex) {
+            setUpdateStatus("Install failed: " + ex.getMessage(), true);
+            updateInstallProgressLabel.setText("Install: failed");
         }
     }
 
@@ -925,8 +1455,85 @@ public final class DownloaderFxApp extends Application {
         saveUpdateConfigButton.setDisable(disabled);
         checkUpdateButton.setDisable(disabled);
         openUpdateFolderButton.setDisable(disabled);
+        browserProfileComboBox.setDisable(disabled);
+        saveBrowserProfileButton.setDisable(disabled);
         downloadUpdateButton.setDisable(disabled || latestUpdateInfo == null
             || !UpdateService.isNewerVersion(latestUpdateInfo.version(), AppInfo.VERSION));
+        installUpdateButton.setDisable(disabled || downloadedUpdatePath == null || !Files.exists(downloadedUpdatePath));
+    }
+
+    private static String toPsSingleQuoted(String value) {
+        return value == null ? "" : value.replace("'", "''");
+    }
+
+    private Path installResultFile() {
+        Path appDir = Path.of(System.getProperty("user.dir", ".")).toAbsolutePath().normalize();
+        Path parent = appDir.getParent();
+        if (parent == null) {
+            return appDir.resolve("muasamcong-install-result.txt");
+        }
+        return parent.resolve("muasamcong-install-result.txt");
+    }
+
+    private Path installLogFile() {
+        Path appDir = Path.of(System.getProperty("user.dir", ".")).toAbsolutePath().normalize();
+        Path parent = appDir.getParent();
+        if (parent == null) {
+            return appDir.resolve("muasamcong-install.log");
+        }
+        return parent.resolve("muasamcong-install.log");
+    }
+
+    private void showInstallResultIfAny() {
+        try {
+            Path resultFile = installResultFile();
+            if (!Files.exists(resultFile)) {
+                return;
+            }
+            String result = Files.readString(resultFile, StandardCharsets.UTF_8)
+                .replace("\uFEFF", "")
+                .trim();
+            Files.deleteIfExists(resultFile);
+            if (result.regionMatches(true, 0, "SUCCESS|", 0, "SUCCESS|".length())) {
+                Files.deleteIfExists(installLogFile());
+                setUpdateStatus("Update installed successfully.", false);
+                updateInstallProgressLabel.setText("Install: 100% - completed");
+                return;
+            }
+
+            String reason = result.regionMatches(true, 0, "FAILED|", 0, "FAILED|".length())
+                ? result.substring("FAILED|".length()).trim()
+                : result;
+            setUpdateStatus("Install failed: " + (reason.isBlank() ? "Unknown" : reason), true);
+            updateInstallProgressLabel.setText("Install: failed");
+            addDetailLog("Install log: " + installLogFile());
+        } catch (Exception ex) {
+            addDetailLog("Read install result failed: " + ex.getMessage());
+        }
+    }
+
+    private static String humanBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + " B";
+        }
+        double kb = bytes / 1024.0;
+        if (kb < 1024) {
+            return String.format("%.1f KB", kb);
+        }
+        double mb = kb / 1024.0;
+        if (mb < 1024) {
+            return String.format("%.1f MB", mb);
+        }
+        double gb = mb / 1024.0;
+        return String.format("%.2f GB", gb);
+    }
+
+    private static String humanBytesSafe(Path file) {
+        try {
+            return humanBytes(Files.size(file));
+        } catch (Exception ex) {
+            return "unknown size";
+        }
     }
 
     private void setUpdateStatus(String message, boolean error) {
@@ -1020,7 +1627,7 @@ public final class DownloaderFxApp extends Application {
                     || "All folders".equals(selectedFolder)
                     || selectedFolder.equals(rootFolder);
                 boolean matchesKeyword = keywordFilter.isBlank()
-                    || (record.keyword() != null && record.keyword().toLowerCase().contains(keywordFilter));
+                    || clearStateSearchText(record).contains(keywordFilter);
                 if (matchesFolder && matchesKeyword) {
                     stateItems.add(new ClearStateItem(record));
                 }
@@ -1055,9 +1662,11 @@ public final class DownloaderFxApp extends Application {
 
         removeSelectedButton.setOnAction(event -> {
             LinkedHashSet<String> keys = new LinkedHashSet<>();
+            List<RunStateStore.StateRecord> selectedRecords = new ArrayList<>();
             for (ClearStateItem item : stateItems) {
                 if (item.selectedProperty().get() && item.record() != null) {
                     keys.add(item.record().key());
+                    selectedRecords.add(item.record());
                 }
             }
 
@@ -1068,8 +1677,13 @@ public final class DownloaderFxApp extends Application {
             }
 
             int removed = RunStateStore.removeByKeys(keys);
+            int removedRows = DownloadWorker.removeBidInfoRowsByStateRecords(selectedRecords);
             updateStatus("State removed: " + removed, "status-success");
             addDetailLog("Removed " + removed + " state records.");
+            if (removedRows > 0) {
+                addDetailLog("Removed " + removedRows + " row(s) from bid_sheet_rows.json.");
+                updateReportFromConfig();
+            }
             refreshList.run();
             if (RunStateStore.loadRecords().isEmpty()) {
                 dialog.close();
@@ -1081,7 +1695,6 @@ public final class DownloaderFxApp extends Application {
             confirm.initOwner(dialog);
             confirm.setTitle("Clear all run state");
             confirm.setHeaderText("Delete all saved state?");
-            confirm.setContentText("This will clear run_state.json, run_history and bid_sheet_rows.json.");
             Optional<ButtonType> result = confirm.showAndWait();
             if (result.isEmpty() || result.get() != ButtonType.OK) {
                 return;
@@ -1144,11 +1757,62 @@ public final class DownloaderFxApp extends Application {
         }
     }
 
+    private static String clearStateSearchText(RunStateStore.StateRecord record) {
+        if (record == null) {
+            return "";
+        }
+        return String.join(" ",
+            safeSearchText(record.keyword()),
+            safeSearchText(record.folderPath()),
+            safeSearchText(folderDisplayPath(record.folderPath()))
+        ).toLowerCase();
+    }
+
+    private static String safeSearchText(String value) {
+        return value == null ? "" : value;
+    }
+
+    private static String folderDisplayPath(String folderPath) {
+        if (folderPath == null || folderPath.isBlank()) {
+            return "[No folder]";
+        }
+        try {
+            Path keywordFolder = Path.of(folderPath).toAbsolutePath().normalize();
+            String keywordFolderName = keywordFolder.getFileName() == null
+                ? keywordFolder.toString()
+                : keywordFolder.getFileName().toString();
+            String parentFolderName = keywordFolder.getParent() != null && keywordFolder.getParent().getFileName() != null
+                ? keywordFolder.getParent().getFileName().toString()
+                : null;
+
+            String compactKeywordFolder = compactText(keywordFolderName, 46);
+            if (parentFolderName == null || parentFolderName.isBlank()) {
+                return "[" + compactKeywordFolder + "]";
+            }
+            return "[" + compactText(parentFolderName, 28) + " / " + compactKeywordFolder + "]";
+        } catch (Exception ex) {
+            return "[Invalid folder]";
+        }
+    }
+
+    private static String compactText(String value, int maxLength) {
+        if (value == null) {
+            return "";
+        }
+        String trimmed = value.trim();
+        if (trimmed.length() <= maxLength) {
+            return trimmed;
+        }
+        return trimmed.substring(0, Math.max(1, maxLength - 3)).trim() + "...";
+    }
+
     private void showGoogleSheetsConfigDialog() {
         GoogleSheetsConfigStore.GoogleSheetsConfig current = GoogleSheetsConfigStore.load().normalized();
 
         CheckBox autoSyncCheck = new CheckBox("Enable auto sync to Google Sheets");
-        autoSyncCheck.setSelected(current.autoSync());
+        boolean firstTimeConfig = (current.spreadsheetId() == null || current.spreadsheetId().isBlank())
+            && (current.credentialsFile() == null || current.credentialsFile().isBlank());
+        autoSyncCheck.setSelected(firstTimeConfig || current.autoSync());
 
         TextField spreadsheetIdField = new TextField(defaultText(current.spreadsheetId()));
         spreadsheetIdField.setPromptText("Spreadsheet ID");
@@ -1242,39 +1906,49 @@ public final class DownloaderFxApp extends Application {
         dialog.showAndWait();
     }
 
-    private void finishTask() {
+    private void finishDownloadTask() {
         boolean shouldRestart = autoRestartAfterStop;
-        activeTask = null;
+        activeDownloadTask = null;
         autoRestartAfterStop = false;
+        activeRunAutoTriggered = false;
         stopRequestedByUser = false;
         stopRequestedByScheduler = false;
-        setRunningState(false);
-        viewLogButton.setDisable(fullLogs.isEmpty());
+        setDownloadRunningState(false);
+        viewLogButton.setDisable(false);
         if (shouldRestart) {
             addDetailLog("Auto run: starting new cycle now.");
             startDownload(true);
         }
     }
 
-    private void setRunningState(boolean running) {
-        runningState = running;
-        folderListView.setDisable(running);
-        addFolderButton.setDisable(running);
-        deleteFolderButton.setDisable(running);
-        checkAllFoldersButton.setDisable(running);
-        uncheckAllFoldersButton.setDisable(running);
-        concurrencySpinner.setDisable(running);
+    private void setDownloadRunningState(boolean running) {
+        startButton.setDisable(running);
         stopButton.setDisable(!running);
-        exportSheetButton.setDisable(running);
-        clearStateButton.setDisable(running);
-        sheetsConfigButton.setDisable(running);
-        autoRunCheckBox.setDisable(running);
-        autoRunIntervalModeRadio.setDisable(running);
-        autoRunSpecificTimeModeRadio.setDisable(running);
-        autoRunSaveButton.setDisable(running);
-        viewLogButton.setDisable(running || fullLogs.isEmpty());
-        progressIndicator.setVisible(running);
-        progressIndicator.setManaged(running);
+        concurrencySpinner.setDisable(running);
+        updateSharedUiState();
+    }
+
+    /** Update shared UI elements based on whether ANY task is running. */
+    private void updateSharedUiState() {
+        boolean anyRunning = activeDownloadTask != null;
+        runningState = anyRunning;
+        folderListView.setDisable(anyRunning);
+        addFolderButton.setDisable(anyRunning);
+        deleteFolderButton.setDisable(anyRunning);
+        checkAllFoldersButton.setDisable(anyRunning);
+        uncheckAllFoldersButton.setDisable(anyRunning);
+        exportSheetButton.setDisable(anyRunning);
+        clearStateButton.setDisable(anyRunning);
+        sheetsConfigButton.setDisable(anyRunning);
+        testDownloadButton.setDisable(anyRunning);
+        browserProfileComboBox.setDisable(anyRunning);
+        saveBrowserProfileButton.setDisable(anyRunning);
+        autoRunCheckBox.setDisable(anyRunning);
+        autoRunStartTimeField.setDisable(anyRunning);
+        autoRunStopTimeField.setDisable(anyRunning);
+        autoRunSaveButton.setDisable(anyRunning);
+        progressIndicator.setVisible(anyRunning);
+        progressIndicator.setManaged(anyRunning);
         refreshAutoRunModeUi();
         refreshStartButtonAvailability();
     }
@@ -1352,15 +2026,12 @@ public final class DownloaderFxApp extends Application {
             AutoRunConfigStore.AutoRunConfig config = AutoRunConfigStore.load().normalized();
             autoRunCheckBox.setSelected(config.enabled());
             autoRunIntervalSpinner.getValueFactory().setValue(config.intervalMinutes());
-            autoRunSpecificTimeField.setText(defaultText(config.specificTime()));
-        if ("SPECIFIC_TIME".equals(config.mode())) {
-            autoRunSpecificTimeModeRadio.setSelected(true);
-        } else {
-            autoRunIntervalModeRadio.setSelected(true);
-        }
-        refreshAutoRunModeUi();
-        updateAutoRunTimeValidation();
-        applyAutoRunSchedule(config.enabled(), config.intervalMinutes(), config.mode(), config.specificTime(), false);
+            autoRunStartTimeField.setText(defaultText(config.startTime()));
+            autoRunStopTimeField.setText(defaultText(config.stopTime()));
+            applyAutoRunDaysToUi(config.days());
+            refreshAutoRunModeUi();
+            updateAutoRunTimeValidation();
+            applyAutoRunSchedule(config.enabled(), config.intervalMinutes(), config.startTime(), config.stopTime(), config.days(), false);
         } catch (Exception ex) {
             addDetailLog("Failed to load auto-run config: " + ex.getMessage());
         }
@@ -1370,29 +2041,82 @@ public final class DownloaderFxApp extends Application {
         int intervalMinutes = normalizeAutoRunInterval(autoRunIntervalSpinner.getValue());
         autoRunIntervalSpinner.getValueFactory().setValue(intervalMinutes);
         boolean enabled = autoRunCheckBox.isSelected();
-        String mode = autoRunSpecificTimeModeRadio.isSelected() ? "SPECIFIC_TIME" : "INTERVAL";
-        String specificTime = normalizeSpecificTime(autoRunSpecificTimeField.getText());
+        String startTime = normalizeSpecificTime(autoRunStartTimeField.getText());
+        String stopTime = normalizeSpecificTime(autoRunStopTimeField.getText());
+        String days = selectedAutoRunDaysCsv();
 
-        if ("SPECIFIC_TIME".equals(mode) && specificTime == null) {
+        if (startTime == null || stopTime == null) {
             updateStatus("Schedule save failed", "status-error");
-            addDetailLog("Invalid specific time. Use HH:mm format (e.g. 08:00).");
+            addDetailLog("Invalid Start/Stop time. Use HH:mm format (e.g. 08:00, 18:00).");
+            updateAutoRunTimeValidation();
+            return;
+        }
+        if (days == null || days.isBlank()) {
+            updateStatus("Schedule save failed", "status-error");
+            addDetailLog("Please select at least one day for auto run.");
             updateAutoRunTimeValidation();
             return;
         }
 
         try {
-            applyAutoRunSchedule(enabled, intervalMinutes, mode, specificTime, true);
+            applyAutoRunSchedule(enabled, intervalMinutes, startTime, stopTime, days, true);
             updateStatus("Schedule saved", "status-success");
             if (!enabled) {
                 addDetailLog("Auto run disabled.");
-            } else if ("SPECIFIC_TIME".equals(mode)) {
-                addDetailLog("Auto run enabled at specific time: " + specificTime + " (daily).");
             } else {
-                addDetailLog("Auto run enabled. Interval: " + intervalMinutes + " minute(s).");
+                addDetailLog("Auto run enabled. Interval: " + intervalMinutes + " minute(s), window: "
+                    + startTime + " - " + stopTime + " | days: " + days + ".");
             }
         } catch (Exception ex) {
             updateStatus("Schedule save failed", "status-error");
             addDetailLog("Unable to save auto-run config: " + ex.getMessage());
+        }
+    }
+
+    private void loadBrowserProfileConfig() {
+        try {
+            BrowserProfileConfigStore.BrowserProfileConfig config = BrowserProfileConfigStore.load().normalized();
+            if ("HIDDEN".equals(config.mode())) {
+                browserProfileComboBox.setValue("Hidden (headless)");
+            } else {
+                browserProfileComboBox.setValue("Visible (Chrome window)");
+            }
+        } catch (Exception ex) {
+            browserProfileComboBox.setValue("Visible (Chrome window)");
+        }
+    }
+
+    private void handleSaveBrowserProfileConfig() {
+        String selected = browserProfileComboBox.getValue();
+        String mode;
+        if ("Hidden (headless)".equals(selected)) {
+            mode = "HIDDEN";
+        } else {
+            mode = "VISIBLE";
+        }
+        try {
+            BrowserProfileConfigStore.save(new BrowserProfileConfigStore.BrowserProfileConfig(mode));
+            updateStatus("Browser mode saved", "status-success");
+            addDetailLog("Browser mode saved: " + mode + ". New sessions will use this mode.");
+        } catch (Exception ex) {
+            updateStatus("Save failed", "status-error");
+            addDetailLog("Unable to save browser mode: " + ex.getMessage());
+        }
+    }
+
+    private int normalizeConcurrency(Integer value) {
+        if (value == null || value <= 0) {
+            return 1;
+        }
+        return Math.max(1, Math.min(value, 10));
+    }
+
+    private void ensureChromeProfilesForConcurrency(int concurrency) {
+        int safeConcurrency = Math.max(1, Math.min(concurrency, 10));
+        Path base = Utils.dataDirectory().resolve("chrome-profiles").toAbsolutePath().normalize();
+        Utils.ensureDirectory(base);
+        for (int i = 1; i <= safeConcurrency; i++) {
+            Utils.ensureDirectory(base.resolve("profile-" + i));
         }
     }
 
@@ -1409,29 +2133,24 @@ public final class DownloaderFxApp extends Application {
 
     private int normalizeAutoRunInterval(Integer value) {
         if (value == null || value <= 0) {
-            return 30;
+            return 1;
         }
-        int clamped = Math.max(30, Math.min(value, 1440));
-        int remainder = clamped % 30;
-        if (remainder == 0) {
-            return clamped;
-        }
-        int rounded = clamped + (30 - remainder);
-        return Math.min(rounded, 1440);
+        return Math.max(1, Math.min(value, 1440));
     }
 
-    private void applyAutoRunSchedule(boolean enabled, int intervalMinutes, String mode, String specificTime, boolean persistConfig) {
+    private void applyAutoRunSchedule(boolean enabled, int intervalMinutes, String startTime, String stopTime, String days, boolean persistConfig) {
         int safeInterval = normalizeAutoRunInterval(intervalMinutes);
-        String safeMode = "SPECIFIC_TIME".equals(mode) ? "SPECIFIC_TIME" : "INTERVAL";
-        String safeSpecificTime = normalizeSpecificTime(specificTime);
+        String safeStart = normalizeSpecificTime(startTime);
+        String safeStop = normalizeSpecificTime(stopTime);
+        String safeDays = normalizeAutoRunDaysCsv(days);
         if (persistConfig) {
-            AutoRunConfigStore.save(new AutoRunConfigStore.AutoRunConfig(enabled, safeInterval, safeMode, safeSpecificTime));
+            AutoRunConfigStore.save(new AutoRunConfigStore.AutoRunConfig(enabled, safeInterval, safeStart, safeStop, safeDays));
         }
-        restartAutoRunScheduler(enabled, safeInterval, safeMode, safeSpecificTime);
+        restartAutoRunScheduler(enabled, safeInterval, safeStart, safeStop, safeDays);
         updateAutoRunInfoLabel();
     }
 
-    private void restartAutoRunScheduler(boolean enabled, int intervalMinutes, String mode, String specificTime) {
+    private void restartAutoRunScheduler(boolean enabled, int intervalMinutes, String startTime, String stopTime, String days) {
         shutdownAutoRunScheduler();
         nextAutoRunAt = null;
         if (!enabled) {
@@ -1446,16 +2165,16 @@ public final class DownloaderFxApp extends Application {
         });
 
         autoRunScheduler = scheduler;
-        scheduleNextAutoRun(intervalMinutes, mode, specificTime);
+        scheduleNextAutoRun(intervalMinutes, startTime, stopTime, days);
     }
 
-    private void scheduleNextAutoRun(int intervalMinutes, String mode, String specificTime) {
+    private void scheduleNextAutoRun(int intervalMinutes, String startTime, String stopTime, String days) {
         ScheduledExecutorService scheduler = autoRunScheduler;
         if (scheduler == null) {
             return;
         }
 
-        LocalDateTime nextRun = calculateNextRun(mode, intervalMinutes, specificTime);
+        LocalDateTime nextRun = calculateNextRun(intervalMinutes, startTime, stopTime, days);
         nextAutoRunAt = nextRun;
         Platform.runLater(this::updateAutoRunInfoLabel);
 
@@ -1464,44 +2183,78 @@ public final class DownloaderFxApp extends Application {
             if (autoRunScheduler == null || !autoRunCheckBox.isSelected()) {
                 return;
             }
-            handleAutoRunTick();
-            scheduleNextAutoRun(intervalMinutes, mode, specificTime);
+            handleAutoRunTick(startTime, stopTime, days);
+            scheduleNextAutoRun(intervalMinutes, startTime, stopTime, days);
         }), delaySeconds, TimeUnit.SECONDS);
     }
 
-    private LocalDateTime calculateNextRun(String mode, int intervalMinutes, String specificTime) {
+    private LocalDateTime calculateNextRun(int intervalMinutes, String startTime, String stopTime, String days) {
         LocalDateTime now = LocalDateTime.now();
-        if (!"SPECIFIC_TIME".equals(mode)) {
+        String safeStart = normalizeSpecificTime(startTime);
+        String safeStop = normalizeSpecificTime(stopTime);
+        Set<Integer> allowedDays = parseAllowedDays(days);
+        if (safeStart == null || safeStop == null) {
             return now.plusMinutes(intervalMinutes);
         }
-
-        String safeTime = normalizeSpecificTime(specificTime);
-        if (safeTime == null) {
+        LocalTime start = LocalTime.parse(safeStart);
+        LocalTime stop = LocalTime.parse(safeStop);
+        LocalTime current = now.toLocalTime();
+        if (allowedDays.contains(now.getDayOfWeek().getValue()) && isWithinAutoRunWindow(current, start, stop)) {
             return now.plusMinutes(intervalMinutes);
         }
-        LocalTime targetTime = LocalTime.parse(safeTime);
-        LocalDateTime todayRun = LocalDate.now().atTime(targetTime);
-        if (todayRun.isAfter(now)) {
-            return todayRun;
+        for (int addDays = 0; addDays <= 14; addDays++) {
+            LocalDate candidateDate = LocalDate.now().plusDays(addDays);
+            int dayValue = candidateDate.getDayOfWeek().getValue();
+            if (!allowedDays.contains(dayValue)) {
+                continue;
+            }
+            LocalDateTime candidateStart = candidateDate.atTime(start);
+            if (candidateStart.isAfter(now)) {
+                return candidateStart;
+            }
         }
-        return LocalDate.now().plusDays(1).atTime(targetTime);
+        return now.plusMinutes(intervalMinutes);
     }
 
-    private void handleAutoRunTick() {
+    private boolean isWithinAutoRunWindow(LocalTime current, LocalTime start, LocalTime stop) {
+        if (start.equals(stop)) {
+            return true;
+        }
+        if (start.isBefore(stop)) {
+            return !current.isBefore(start) && current.isBefore(stop);
+        }
+        return !current.isBefore(start) || current.isBefore(stop);
+    }
+
+    private void handleAutoRunTick(String startTime, String stopTime, String days) {
         if (!autoRunCheckBox.isSelected()) {
             return;
         }
 
-        String mode = autoRunSpecificTimeModeRadio.isSelected() ? "SPECIFIC_TIME" : "INTERVAL";
+        String safeStart = normalizeSpecificTime(startTime);
+        String safeStop = normalizeSpecificTime(stopTime);
+        String safeDays = normalizeAutoRunDaysCsv(days);
         int intervalMinutes = normalizeAutoRunInterval(autoRunIntervalSpinner.getValue());
-        String specificTime = normalizeSpecificTime(autoRunSpecificTimeField.getText());
-        if ("SPECIFIC_TIME".equals(mode)) {
-            addDetailLog("Auto run: cycle triggered at configured time " + defaultText(specificTime) + ".");
-        } else {
-            addDetailLog("Auto run: cycle triggered (every " + intervalMinutes + " minute(s)).");
+        if (safeStart == null || safeStop == null) {
+            addDetailLog("Auto run: invalid Start/Stop time. Auto run disabled.");
+            autoRunCheckBox.setSelected(false);
+            applyAutoRunSchedule(false, intervalMinutes, autoRunStartTimeField.getText(), autoRunStopTimeField.getText(), safeDays, true);
+            return;
         }
+        LocalTime now = LocalTime.now();
+        Set<Integer> allowedDays = parseAllowedDays(safeDays);
+        if (!allowedDays.contains(LocalDate.now().getDayOfWeek().getValue())
+            || !isWithinAutoRunWindow(now, LocalTime.parse(safeStart), LocalTime.parse(safeStop))) {
+            addDetailLog("Auto run: stop time reached. Auto run disabled.");
+            autoRunCheckBox.setSelected(false);
+            applyAutoRunSchedule(false, intervalMinutes, safeStart, safeStop, safeDays, true);
+            updateStatus("Auto run stopped", "status-success");
+            return;
+        }
+        addDetailLog("Auto run: cycle triggered (every " + intervalMinutes + " minute(s), window "
+            + safeStart + "-" + safeStop + ").");
 
-        if (activeTask != null) {
+        if (activeDownloadTask != null) {
             autoRestartAfterStop = true;
             addDetailLog("Auto run: current cycle still running, queued next cycle (graceful mode).");
             return;
@@ -1517,45 +2270,52 @@ public final class DownloaderFxApp extends Application {
             return;
         }
 
-        String mode = autoRunSpecificTimeModeRadio.isSelected() ? "SPECIFIC_TIME" : "INTERVAL";
         int intervalMinutes = normalizeAutoRunInterval(autoRunIntervalSpinner.getValue());
-        String specificTime = normalizeSpecificTime(autoRunSpecificTimeField.getText());
+        String startTime = normalizeSpecificTime(autoRunStartTimeField.getText());
+        String stopTime = normalizeSpecificTime(autoRunStopTimeField.getText());
+        String days = normalizeAutoRunDaysCsv(selectedAutoRunDaysCsv());
 
-        String scheduleText = "SPECIFIC_TIME".equals(mode)
-            ? "Auto run at " + (specificTime == null ? "--:--" : specificTime) + " daily"
-            : "Auto run every " + intervalMinutes + " minute(s)";
+        String scheduleText = "Every " + intervalMinutes + "m"
+            + " • Window: " + (startTime == null ? "--:--" : startTime)
+            + "-" + (stopTime == null ? "--:--" : stopTime)
+            + " • Days: " + formatAutoRunDaysForLabel(days);
 
         String nextRunText = nextAutoRunAt == null
             ? ""
-            : " | Next: " + nextAutoRunAt.format(NEXT_RUN_FORMAT);
+            : " • Next: " + nextAutoRunAt.format(NEXT_RUN_FORMAT);
         autoRunInfoLabel.setText(scheduleText + nextRunText);
     }
 
     private void refreshAutoRunModeUi() {
         if (runningState) {
             autoRunIntervalSpinner.setDisable(true);
-            autoRunSpecificTimeField.setDisable(true);
+            autoRunStartTimeField.setDisable(true);
+            autoRunStopTimeField.setDisable(true);
+            autoRunDayChecks.forEach(cb -> cb.setDisable(true));
             updateAutoRunTimeValidation();
             return;
         }
-        boolean specificMode = autoRunSpecificTimeModeRadio.isSelected();
-        autoRunIntervalSpinner.setDisable(specificMode);
-        autoRunSpecificTimeField.setDisable(!specificMode);
+        autoRunIntervalSpinner.setDisable(false);
+        autoRunStartTimeField.setDisable(false);
+        autoRunStopTimeField.setDisable(false);
+        autoRunDayChecks.forEach(cb -> cb.setDisable(false));
         updateAutoRunTimeValidation();
     }
 
     private void updateAutoRunTimeValidation() {
-        boolean specificMode = autoRunSpecificTimeModeRadio.isSelected();
-        String specificTime = normalizeSpecificTime(autoRunSpecificTimeField.getText());
-        boolean invalid = specificMode && specificTime == null;
+        String startTime = normalizeSpecificTime(autoRunStartTimeField.getText());
+        String stopTime = normalizeSpecificTime(autoRunStopTimeField.getText());
+        boolean noDaySelected = selectedAutoRunDaysCsv() == null;
+        boolean invalid = startTime == null || stopTime == null || noDaySelected;
 
-        autoRunSpecificTimeField.pseudoClassStateChanged(javafx.css.PseudoClass.getPseudoClass("error"), invalid);
+        autoRunStartTimeField.pseudoClassStateChanged(javafx.css.PseudoClass.getPseudoClass("error"), startTime == null);
+        autoRunStopTimeField.pseudoClassStateChanged(javafx.css.PseudoClass.getPseudoClass("error"), stopTime == null);
 
-        boolean canSave = !runningState && (!specificMode || !invalid);
+        boolean canSave = !runningState && !invalid;
         autoRunSaveButton.setDisable(!canSave);
 
         if (invalid) {
-            autoRunInfoLabel.setText("Specific time is invalid. Use HH:mm (e.g. 08:00).");
+            autoRunInfoLabel.setText("Start/Stop time or days are invalid. Use HH:mm and select at least one day.");
             autoRunInfoLabel.getStyleClass().remove("status-success");
             if (!autoRunInfoLabel.getStyleClass().contains("status-error")) {
                 autoRunInfoLabel.getStyleClass().add("status-error");
@@ -1566,6 +2326,98 @@ public final class DownloaderFxApp extends Application {
                 autoRunInfoLabel.getStyleClass().add("field-hint");
             }
             updateAutoRunInfoLabel();
+        }
+    }
+
+    private String selectedAutoRunDaysCsv() {
+        String[] tokens = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"};
+        List<String> selected = new ArrayList<>();
+        for (int i = 0; i < autoRunDayChecks.size() && i < tokens.length; i++) {
+            if (autoRunDayChecks.get(i).isSelected()) {
+                selected.add(tokens[i]);
+            }
+        }
+        if (selected.isEmpty()) {
+            return null;
+        }
+        return String.join(",", selected);
+    }
+
+    private String normalizeAutoRunDaysCsv(String daysCsv) {
+        if (daysCsv == null || daysCsv.isBlank()) {
+            return null;
+        }
+        List<String> allowedOrder = Arrays.asList("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN");
+        LinkedHashSet<String> selected = new LinkedHashSet<>();
+        for (String part : daysCsv.split(",")) {
+            if (part == null) {
+                continue;
+            }
+            String token = part.trim().toUpperCase();
+            if (allowedOrder.contains(token)) {
+                selected.add(token);
+            }
+        }
+        if (selected.isEmpty()) {
+            return null;
+        }
+        List<String> ordered = new ArrayList<>();
+        for (String token : allowedOrder) {
+            if (selected.contains(token)) {
+                ordered.add(token);
+            }
+        }
+        return String.join(",", ordered);
+    }
+
+    private String formatAutoRunDaysForLabel(String daysCsv) {
+        String normalized = normalizeAutoRunDaysCsv(daysCsv);
+        if (normalized == null) {
+            return "-";
+        }
+        if ("MON,TUE,WED,THU,FRI,SAT,SUN".equals(normalized)) {
+            return "Everyday";
+        }
+        if ("MON,TUE,WED,THU,FRI".equals(normalized)) {
+            return "Mon-Fri";
+        }
+        if ("SAT,SUN".equals(normalized)) {
+            return "Sat-Sun";
+        }
+        String[] parts = normalized.split(",");
+        for (int i = 0; i < parts.length; i++) {
+            parts[i] = parts[i].substring(0, 1).toUpperCase() + parts[i].substring(1).toLowerCase();
+        }
+        return String.join(", ", parts);
+    }
+
+    private Set<Integer> parseAllowedDays(String daysCsv) {
+        String normalized = normalizeAutoRunDaysCsv(daysCsv);
+        if (normalized == null) {
+            return Set.of(1, 2, 3, 4, 5, 6, 7);
+        }
+        LinkedHashSet<Integer> days = new LinkedHashSet<>();
+        for (String token : normalized.split(",")) {
+            switch (token) {
+                case "MON" -> days.add(1);
+                case "TUE" -> days.add(2);
+                case "WED" -> days.add(3);
+                case "THU" -> days.add(4);
+                case "FRI" -> days.add(5);
+                case "SAT" -> days.add(6);
+                case "SUN" -> days.add(7);
+                default -> {
+                }
+            }
+        }
+        return days.isEmpty() ? Set.of(1, 2, 3, 4, 5, 6, 7) : days;
+    }
+
+    private void applyAutoRunDaysToUi(String daysCsv) {
+        Set<Integer> allowedDays = parseAllowedDays(daysCsv);
+        for (int i = 0; i < autoRunDayChecks.size(); i++) {
+            int dayValue = i + 1;
+            autoRunDayChecks.get(i).setSelected(allowedDays.contains(dayValue));
         }
     }
 
@@ -1580,8 +2432,23 @@ public final class DownloaderFxApp extends Application {
 
     @Override
     public void stop() {
-        shutdownAutoRunScheduler();
-        DownloadCoordinator.requestStop();
+        try {
+            Utils.clearLogSink();
+            shutdownAutoRunScheduler();
+            if (activeDownloadTask != null) {
+                Thread cleanup = new Thread(() -> {
+                    try {
+                        DownloadCoordinator.requestStop();
+                    } catch (Throwable ignored) {
+                        // Best effort shutdown only; never block JavaFX shutdown.
+                    }
+                }, "Downloader-Shutdown-Cleanup");
+                cleanup.setDaemon(true);
+                cleanup.start();
+            }
+        } catch (Throwable ignored) {
+            // JavaFX shutdown must not fail because browser cleanup failed.
+        }
     }
 
     private String defaultText(String value) {
@@ -1630,65 +2497,31 @@ public final class DownloaderFxApp extends Application {
         setFolderActionsDisabled(true);
         updateStatus("Opening folder picker...", "status-running");
 
-        Task<List<String>> task = new Task<>() {
-            @Override
-            protected List<String> call() throws Exception {
-                return openMultipleDirectoriesNative();
+        try {
+            List<String> selectedPaths = openMultipleDirectoriesWithSwing();
+            int added = addFolderPaths(selectedPaths);
+            if (added > 0) {
+                saveFolderSelections();
+                updateStatus("Folders added: " + added, "status-success");
+            } else if (selectedPaths == null || selectedPaths.isEmpty()) {
+                updateStatus("Add cancelled", "status-idle");
+            } else {
+                updateStatus("No new folders", "status-error");
+                addDetailLog("All selected folders already exist.");
             }
-        };
-
-        task.setOnSucceeded(event -> {
-            try {
-                List<String> selectedPaths = task.getValue();
-                int added = addFolderPaths(selectedPaths);
-                if (added > 0) {
-                    saveFolderSelections();
-                    updateStatus("Folders added: " + added, "status-success");
-                } else if (selectedPaths == null || selectedPaths.isEmpty()) {
-                    updateStatus("Add cancelled", "status-idle");
-                } else {
-                    updateStatus("No new folders", "status-error");
-                    addDetailLog("All selected folders already exist.");
-                }
-            } finally {
-                folderChooserOpening.set(false);
-                setFolderActionsDisabled(false);
-            }
-        });
-
-        task.setOnFailed(event -> {
-            try {
-                Throwable ex = task.getException();
-                addDetailLog("Native folder picker failed, opening fallback picker: " + (ex == null ? "Unknown" : ex.getMessage()));
-                openFallbackMultiFolderPicker();
-            } finally {
-                folderChooserOpening.set(false);
-                setFolderActionsDisabled(false);
-            }
-        });
-
-        Thread worker = new Thread(task, "Multi-Folder-Picker");
-        worker.setDaemon(true);
-        worker.start();
-    }
-
-    private void openFallbackMultiFolderPicker() {
-        List<String> selectedPaths = openMultipleDirectoriesWithSwing();
-        int added = addFolderPaths(selectedPaths);
-        if (added > 0) {
-            saveFolderSelections();
-            updateStatus("Folders added: " + added, "status-success");
-        } else if (selectedPaths == null || selectedPaths.isEmpty()) {
-            updateStatus("Add cancelled", "status-idle");
-        } else {
-            updateStatus("No new folders", "status-error");
-            addDetailLog("All selected folders already exist.");
+        } catch (Exception ex) {
+            updateStatus("Folder picker failed", "status-error");
+            addDetailLog("Folder picker failed: " + ex.getMessage());
+        } finally {
+            folderChooserOpening.set(false);
+            setFolderActionsDisabled(false);
         }
     }
 
     private List<String> openMultipleDirectoriesWithSwing() {
         List<String> selectedPaths = new ArrayList<>();
         Runnable chooserTask = () -> {
+            applySystemSwingLookAndFeel();
             JFileChooser chooser = new JFileChooser();
             chooser.setDialogTitle("Select folders");
             chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
@@ -1724,10 +2557,17 @@ public final class DownloaderFxApp extends Application {
                 SwingUtilities.invokeAndWait(chooserTask);
             }
         } catch (Exception ex) {
-            updateStatus("Folder picker failed", "status-error");
-            addDetailLog("Fallback folder picker failed: " + ex.getMessage());
+            throw new RuntimeException("Swing folder picker failed: " + ex.getMessage(), ex);
         }
         return selectedPaths;
+    }
+
+    private void applySystemSwingLookAndFeel() {
+        try {
+            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+        } catch (Exception ignored) {
+            // Keep the default Swing look if the system look and feel is unavailable.
+        }
     }
 
     private void setFolderActionsDisabled(boolean disabled) {
@@ -1735,154 +2575,6 @@ public final class DownloaderFxApp extends Application {
         deleteFolderButton.setDisable(disabled || runningState);
         checkAllFoldersButton.setDisable(disabled || runningState);
         uncheckAllFoldersButton.setDisable(disabled || runningState);
-    }
-
-    private List<String> openMultipleDirectoriesNative() throws Exception {
-        if (!System.getProperty("os.name", "").toLowerCase().contains("win")) {
-            throw new UnsupportedOperationException("Native multi-folder picker is only supported on Windows.");
-        }
-
-        Path script = Files.createTempFile("muasamcong-folder-picker-", ".ps1");
-        Files.writeString(script, windowsMultiFolderPickerScript(), StandardCharsets.UTF_8);
-        try {
-            Process process = new ProcessBuilder(
-                "powershell.exe",
-                "-NoProfile",
-                "-STA",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                script.toAbsolutePath().toString()
-            )
-                .redirectErrorStream(true)
-                .start();
-
-            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            int exitCode = process.waitFor();
-            if (exitCode != 0) {
-                throw new IOException(output.isBlank() ? "PowerShell folder picker failed." : output.trim());
-            }
-
-            List<String> paths = new ArrayList<>();
-            for (String line : output.split("\\R")) {
-                String path = line.trim();
-                if (!path.isEmpty()) {
-                    paths.add(path);
-                }
-            }
-            return paths;
-        } finally {
-            try {
-                Files.deleteIfExists(script);
-            } catch (IOException ignored) {
-                // best effort cleanup
-            }
-        }
-    }
-
-    private String windowsMultiFolderPickerScript() {
-        return """
-            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-            Add-Type -TypeDefinition @"
-            using System;
-            using System.Runtime.InteropServices;
-
-            [Flags]
-            public enum FOS : uint {
-                FOS_PICKFOLDERS = 0x00000020,
-                FOS_FORCEFILESYSTEM = 0x00000040,
-                FOS_ALLOWMULTISELECT = 0x00000200,
-                FOS_PATHMUSTEXIST = 0x00000800
-            }
-
-            [StructLayout(LayoutKind.Sequential, Pack = 4)]
-            public struct PROPERTYKEY {
-                public Guid fmtid;
-                public uint pid;
-            }
-
-            [ComImport]
-            [Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")]
-            public class FileOpenDialogRCW { }
-
-            [ComImport]
-            [Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE")]
-            [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-            public interface IShellItem {
-                void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
-                void GetParent(out IShellItem ppsi);
-                void GetDisplayName(uint sigdnName, out IntPtr ppszName);
-                void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
-                void Compare(IShellItem psi, uint hint, out int piOrder);
-            }
-
-            [ComImport]
-            [Guid("B63EA76D-1F85-456F-A19C-48159EFA858B")]
-            [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-            public interface IShellItemArray {
-                void BindToHandler(IntPtr pbc, ref Guid rbhid, ref Guid riid, out IntPtr ppvOut);
-                void GetPropertyStore(int flags, ref Guid riid, out IntPtr ppv);
-                void GetPropertyDescriptionList(ref PROPERTYKEY keyType, ref Guid riid, out IntPtr ppv);
-                void GetAttributes(int AttribFlags, uint sfgaoMask, out uint psfgaoAttribs);
-                void GetCount(out uint pdwNumItems);
-                void GetItemAt(uint dwIndex, out IShellItem ppsi);
-            }
-
-            [ComImport]
-            [Guid("D57C7288-D4AD-4768-BE02-9D969532D960")]
-            [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-            public interface IFileOpenDialog {
-                [PreserveSig] int Show(IntPtr parent);
-                void SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);
-                void SetFileTypeIndex(uint iFileType);
-                void GetFileTypeIndex(out uint piFileType);
-                void Advise(IntPtr pfde, out uint pdwCookie);
-                void Unadvise(uint dwCookie);
-                void SetOptions(FOS fos);
-                void GetOptions(out FOS pfos);
-                void SetDefaultFolder(IShellItem psi);
-                void SetFolder(IShellItem psi);
-                void GetFolder(out IShellItem ppsi);
-                void GetCurrentSelection(out IShellItem ppsi);
-                void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
-                void GetFileName(out IntPtr pszName);
-                void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
-                void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
-                void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
-                void GetResult(out IShellItem ppsi);
-                void AddPlace(IShellItem psi, int fdap);
-                void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string pszDefaultExtension);
-                void Close(int hr);
-                void SetClientGuid(ref Guid guid);
-                void ClearClientData();
-                void SetFilter(IntPtr pFilter);
-                void GetResults(out IShellItemArray ppenum);
-                void GetSelectedItems(out IShellItemArray ppsai);
-            }
-            "@
-
-            $dialog = New-Object FileOpenDialogRCW
-            $fileDialog = [IFileOpenDialog]$dialog
-            $fileDialog.SetTitle("Select folders")
-            $fileDialog.SetOptions([FOS]::FOS_PICKFOLDERS -bor [FOS]::FOS_FORCEFILESYSTEM -bor [FOS]::FOS_ALLOWMULTISELECT -bor [FOS]::FOS_PATHMUSTEXIST)
-            $hr = $fileDialog.Show([IntPtr]::Zero)
-            if ($hr -eq -2147023673) { exit 0 }
-            if ($hr -ne 0) { exit 1 }
-
-            $items = $null
-            $fileDialog.GetResults([ref]$items)
-            $count = 0
-            $items.GetCount([ref]$count)
-            for ($i = 0; $i -lt $count; $i++) {
-                $item = $null
-                $items.GetItemAt([uint32]$i, [ref]$item)
-                $ptr = [IntPtr]::Zero
-                $item.GetDisplayName(0x80058000, [ref]$ptr)
-                $path = [Runtime.InteropServices.Marshal]::PtrToStringUni($ptr)
-                [Runtime.InteropServices.Marshal]::FreeCoTaskMem($ptr)
-                if ($path) { [Console]::WriteLine($path) }
-            }
-            """;
     }
 
     private int addFolderPaths(List<String> paths) {
@@ -2013,17 +2705,37 @@ public final class DownloaderFxApp extends Application {
         }
         Platform.runLater(() -> {
             String normalized = line.trim();
-            fullLogs.add(normalized);
+            fullLogs.add(timestampedLog(normalized));
             updateProgressFromLog(normalized);
             refreshProgressView();
         });
     }
 
     private void updateProgressFromLog(String line) {
+        Matcher loadedKeywordMatcher = LOADED_KEYWORD_PATTERN.matcher(line == null ? "" : line.trim());
+        if (loadedKeywordMatcher.find()) {
+            String keyword = loadedKeywordMatcher.group(1);
+            String folder = loadedKeywordMatcher.group(2).trim();
+            if (!keywordOrder.contains(keyword)) {
+                keywordOrder.add(keyword);
+            }
+            keywordIndexState.putIfAbsent(keyword, keywordIndexState.size() + 1);
+            keywordFolderState.put(keyword, folder);
+            keywordResultState.putIfAbsent(keyword, "PENDING");
+            keywordDownloadState.putIfAbsent(keyword, "-");
+            return;
+        }
+
         String keyword = extractKeyword(line);
-        if (keyword != null && line.contains("| status=START |")) {
+        String status = extractRuntimeStatus(line);
+        if (keyword != null && "START".equals(status)) {
+            moveKeywordToTop(keyword);
             keywordResultState.put(keyword, "RUNNING");
             keywordDownloadState.putIfAbsent(keyword, "-");
+            keywordStartTimeState.put(keyword, extractRuntimeTime(line));
+            keywordEndTimeState.put(keyword, "-");
+            keywordMessageState.put(keyword, messageForDisplay(extractRuntimeMessage(line), "Started"));
+            failedKeywordSet.remove(keyword);
         }
 
         if (line.startsWith("Loaded keywords:")) {
@@ -2038,10 +2750,13 @@ public final class DownloaderFxApp extends Application {
             return;
         }
 
-        if (line.contains("| status=SUCCESS |")) {
+        if ("SUCCESS".equals(status)) {
             successCount++;
             if (keyword != null) {
                 keywordResultState.put(keyword, "SUCCESS");
+                keywordEndTimeState.put(keyword, extractRuntimeTime(line));
+                keywordMessageState.put(keyword, messageForDisplay(extractRuntimeMessage(line), "Completed"));
+                failedKeywordSet.remove(keyword);
             }
             return;
         }
@@ -2052,44 +2767,63 @@ public final class DownloaderFxApp extends Application {
                 int downloaded = Integer.parseInt(matcher.group(1));
                 int expected = Integer.parseInt(matcher.group(2));
                 keywordDownloadState.put(keyword, downloaded + "/" + expected);
-                if (downloaded < expected) {
-                    keywordResultState.put(keyword, "FAILED");
-                }
             }
         }
 
-        if (keyword != null && line.contains("Downloaded files mismatch:")) {
-            keywordResultState.put(keyword, "FAILED");
-        }
-
         if (line.contains("Exceeded retry limit")) {
-            failCount++;
             if (keyword != null) {
                 failedKeywords.add(keyword);
+                failedKeywordSet.add(keyword);
+                failCount = failedKeywordSet.size();
                 keywordResultState.put(keyword, "FAILED");
+                keywordEndTimeState.put(keyword, extractRuntimeTime(line));
+                keywordMessageState.put(keyword, "Exceeded retry limit");
             }
             return;
         }
 
-        if (keyword != null && line.contains("| status=STOP |")) {
+        if (keyword != null && "STOP".equals(status)) {
             keywordResultState.put(keyword, "STOPPED");
+            keywordEndTimeState.put(keyword, extractRuntimeTime(line));
+            keywordMessageState.put(keyword, messageForDisplay(extractRuntimeMessage(line), "Stopped"));
+        }
+
+        if (keyword != null && !line.isBlank()) {
+            keywordMessageState.put(keyword, messageForDisplay(extractRuntimeMessage(line), keywordMessageState.get(keyword)));
         }
     }
 
     private void refreshProgressView() {
-        loadedLabel.setText("Loaded keywords: " + loadedKeywords);
+        loadedLabel.setText("Loaded: " + loadedKeywords);
         successLabel.setText("Success: " + successCount);
+        failCount = failedKeywordSet.size();
         failedLabel.setText("Failed: " + failCount);
-        logArea.setText(buildKeywordProgressText());
+        List<KeywordProgressRow> rows = buildKeywordProgressRows();
+        List<String> mainSelectedKeywords = selectedKeywords(progressTableView);
+        int mainSelectedIndex = progressTableView == null ? -1 : progressTableView.getSelectionModel().getSelectedIndex();
+        List<String> detailSelectedKeywords = selectedKeywords(detailProgressTableView);
+        int detailSelectedIndex = detailProgressTableView == null ? -1 : detailProgressTableView.getSelectionModel().getSelectedIndex();
+
+        progressRows.setAll(rows);
+
+        restoreProgressSelection(progressTableView, mainSelectedKeywords, mainSelectedIndex);
+        restoreProgressSelection(detailProgressTableView, detailSelectedKeywords, detailSelectedIndex);
     }
 
     private void clearRunData() {
         fullLogs.clear();
         failedKeywords.clear();
+        failedKeywordSet.clear();
+        keywordOrder.clear();
+        keywordIndexState.clear();
+        keywordFolderState.clear();
         keywordDownloadState.clear();
         keywordResultState.clear();
+        keywordMessageState.clear();
+        keywordStartTimeState.clear();
+        keywordEndTimeState.clear();
         resetProgressCounters();
-        viewLogButton.setDisable(true);
+        viewLogButton.setDisable(false);
     }
 
     private void resetProgressCounters() {
@@ -2102,37 +2836,43 @@ public final class DownloaderFxApp extends Application {
         if (line == null || line.isBlank()) {
             return;
         }
-        Platform.runLater(() -> fullLogs.add(line.trim()));
+        Platform.runLater(() -> {
+            String normalized = line.trim();
+            fullLogs.add(timestampedLog(normalized));
+        });
+    }
+
+    private String timestampedLog(String line) {
+        return LocalDateTime.now().format(LOG_TIME_FORMAT) + " " + line;
     }
 
     private void showLogDetails() {
-        TextArea detailsArea = new TextArea(buildDetailText());
-        detailsArea.setEditable(false);
-        detailsArea.setWrapText(true);
-        detailsArea.setPrefRowCount(28);
+        Path logFile = appLogFile();
+        if (!Files.exists(logFile)) {
+            updateStatus("Log not found", "status-error");
+            addDetailLog("App log file not found: " + logFile);
+            return;
+        }
 
-        VBox content = new VBox(detailsArea);
-        content.setPadding(new Insets(12));
-        VBox.setVgrow(detailsArea, Priority.ALWAYS);
+        try {
+            Desktop.getDesktop().open(logFile.toFile());
+        } catch (Exception ex) {
+            updateStatus("Open log failed", "status-error");
+            addDetailLog("Unable to open app log: " + ex.getMessage());
+        }
+    }
 
-        Scene detailScene = new Scene(content, 920, 640);
-        Stage detailStage = new Stage();
-        detailStage.initOwner(ownerStage);
-        detailStage.initModality(Modality.WINDOW_MODAL);
-        detailStage.setTitle("Detailed logs");
-        detailStage.setScene(detailScene);
-        detailStage.show();
+    private Path appLogFile() {
+        return Path.of("logs", "app-" + LocalDate.now() + ".log").toAbsolutePath().normalize();
     }
 
     private void showProgressFullscreen() {
-        TextArea progressArea = new TextArea(buildKeywordProgressText());
-        progressArea.setEditable(false);
-        progressArea.setWrapText(false);
-        progressArea.setPrefRowCount(28);
+        TableView<KeywordProgressRow> detailTableView = createProgressTable(true);
+        detailProgressTableView = detailTableView;
 
-        VBox content = new VBox(progressArea);
+        VBox content = new VBox(10, detailTableView);
         content.setPadding(new Insets(12));
-        VBox.setVgrow(progressArea, Priority.ALWAYS);
+        VBox.setVgrow(detailTableView, Priority.ALWAYS);
 
         Scene detailScene = new Scene(content, 980, 680);
         Stage detailStage = new Stage();
@@ -2140,6 +2880,11 @@ public final class DownloaderFxApp extends Application {
         detailStage.initModality(Modality.WINDOW_MODAL);
         detailStage.setTitle("Progress details");
         detailStage.setScene(detailScene);
+        detailStage.setOnHidden(event -> {
+            if (detailProgressTableView == detailTableView) {
+                detailProgressTableView = null;
+            }
+        });
         detailStage.show();
     }
 
@@ -2164,28 +2909,299 @@ public final class DownloaderFxApp extends Application {
     }
 
     private String buildKeywordProgressText() {
-        if (keywordResultState.isEmpty()) {
+        List<KeywordProgressRow> rows = buildKeywordProgressRows();
+        if (rows.isEmpty()) {
             return "No keyword progress yet.";
         }
 
         StringBuilder builder = new StringBuilder();
-        for (Map.Entry<String, String> entry : keywordResultState.entrySet()) {
-            String keyword = entry.getKey();
-            String status = entry.getValue();
-            String downloaded = keywordDownloadState.getOrDefault(keyword, "-");
-            builder.append(keyword)
-                .append(" | Downloaded files: ")
-                .append(downloaded)
-                .append(" | ")
-                .append(status)
+        for (KeywordProgressRow row : rows) {
+            builder.append(String.format("[%03d] %s  %s  Downloaded files: %s",
+                    row.index(), row.keyword(), row.status(), row.downloaded()))
+                .append(System.lineSeparator())
+                .append("      Folder: ")
+                .append(row.folder())
                 .append(System.lineSeparator());
         }
         return builder.toString().trim();
     }
 
+    private List<KeywordProgressRow> buildKeywordProgressRows() {
+        List<String> displayOrder = keywordOrder.isEmpty()
+            ? new ArrayList<>(keywordResultState.keySet())
+            : keywordOrder;
+        List<KeywordProgressRow> rows = new ArrayList<>();
+        for (String keyword : displayOrder) {
+            rows.add(new KeywordProgressRow(
+                keywordIndexState.getOrDefault(keyword, 0),
+                keyword,
+                keywordResultState.getOrDefault(keyword, "PENDING"),
+                keywordDownloadState.getOrDefault(keyword, "-"),
+                keywordFolderState.getOrDefault(keyword, "-"),
+                keywordMessageState.getOrDefault(keyword, "-"),
+                keywordStartTimeState.getOrDefault(keyword, "-"),
+                keywordEndTimeState.getOrDefault(keyword, "-")
+            ));
+        }
+        return rows;
+    }
+
+    private TableView<KeywordProgressRow> createProgressTable(boolean detailMode) {
+        TableView<KeywordProgressRow> tableView = new TableView<>(progressRows);
+        tableView.getStyleClass().add("progress-table-view");
+        if (detailMode) {
+            tableView.getStyleClass().add("progress-table-view-detail");
+        }
+        tableView.setPlaceholder(new Label("No keyword progress yet."));
+        tableView.getSelectionModel().setSelectionMode(SelectionMode.MULTIPLE);
+
+        TableColumn<KeywordProgressRow, String> keywordCol = new TableColumn<>("Keyword");
+        keywordCol.setCellValueFactory(cell -> cell.getValue().keywordDisplayProperty());
+        keywordCol.setMinWidth(210);
+
+        TableColumn<KeywordProgressRow, String> folderCol = new TableColumn<>("Folder");
+        folderCol.setCellValueFactory(cell -> cell.getValue().folderProperty());
+        folderCol.setMinWidth(220);
+
+        TableColumn<KeywordProgressRow, String> statusCol = new TableColumn<>("Status");
+        statusCol.setCellValueFactory(cell -> cell.getValue().statusProperty());
+        statusCol.setMinWidth(95);
+        statusCol.setCellFactory(column -> new TableCell<>() {
+            @Override
+            protected void updateItem(String item, boolean empty) {
+                super.updateItem(item, empty);
+                if (empty || item == null) {
+                    setText(null);
+                    setTextFill(Color.web("#0f172a"));
+                    setStyle("");
+                    return;
+                }
+                setText(item);
+                setTextFill(statusColor(item));
+                setStyle("-fx-text-fill: " + statusColorHex(item) + "; -fx-font-weight: 700;");
+            }
+        });
+
+        TableColumn<KeywordProgressRow, String> progressCol = new TableColumn<>("Progress");
+        progressCol.setCellValueFactory(cell -> cell.getValue().downloadedProperty());
+        progressCol.setMinWidth(110);
+
+        TableColumn<KeywordProgressRow, String> messageCol = new TableColumn<>("Message");
+        messageCol.setCellValueFactory(cell -> cell.getValue().messageProperty());
+        messageCol.setMinWidth(190);
+
+        TableColumn<KeywordProgressRow, String> startCol = new TableColumn<>("Start time");
+        startCol.setCellValueFactory(cell -> cell.getValue().startTimeProperty());
+        startCol.setMinWidth(120);
+
+        TableColumn<KeywordProgressRow, String> endCol = new TableColumn<>("End time");
+        endCol.setCellValueFactory(cell -> cell.getValue().endTimeProperty());
+        endCol.setMinWidth(120);
+
+        tableView.getColumns().setAll(keywordCol, folderCol, statusCol, progressCol, messageCol, startCol, endCol);
+        tableView.setColumnResizePolicy(detailMode
+            ? TableView.UNCONSTRAINED_RESIZE_POLICY
+            : TableView.CONSTRAINED_RESIZE_POLICY_FLEX_LAST_COLUMN);
+        attachProgressCopyMenu(tableView);
+        return tableView;
+    }
+
+    private void attachProgressCopyMenu(TableView<KeywordProgressRow> tableView) {
+        MenuItem copySelectedItem = new MenuItem("Copy selected");
+        copySelectedItem.setOnAction(event -> {
+            List<KeywordProgressRow> selectedRows = new ArrayList<>(tableView.getSelectionModel().getSelectedItems());
+            copyProgressRowsToClipboard(selectedRows);
+        });
+
+        MenuItem copyAllItem = new MenuItem("Copy all progress");
+        copyAllItem.setOnAction(event -> copyProgressRowsToClipboard(new ArrayList<>(tableView.getItems())));
+
+        ContextMenu contextMenu = new ContextMenu(copySelectedItem, copyAllItem);
+        contextMenu.setOnShowing(event -> copySelectedItem.setDisable(tableView.getSelectionModel().getSelectedItems().isEmpty()));
+        tableView.setContextMenu(contextMenu);
+    }
+
+    private void copyProgressRowsToClipboard(List<KeywordProgressRow> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return;
+        }
+
+        StringBuilder builder = new StringBuilder();
+        for (KeywordProgressRow row : rows) {
+            builder.append(formatProgressRowForCopy(row)).append(System.lineSeparator()).append(System.lineSeparator());
+        }
+
+        ClipboardContent content = new ClipboardContent();
+        content.putString(builder.toString().trim());
+        Clipboard.getSystemClipboard().setContent(content);
+    }
+
+    private List<String> selectedKeywords(TableView<KeywordProgressRow> tableView) {
+        List<String> selectedKeywords = new ArrayList<>();
+        if (tableView == null) {
+            return selectedKeywords;
+        }
+        for (KeywordProgressRow row : tableView.getSelectionModel().getSelectedItems()) {
+            if (row != null && row.keyword() != null) {
+                selectedKeywords.add(row.keyword());
+            }
+        }
+        return selectedKeywords;
+    }
+
+    private void restoreProgressSelection(TableView<KeywordProgressRow> tableView, List<String> selectedKeywords, int selectedIndex) {
+        if (tableView == null) {
+            return;
+        }
+
+        if (selectedKeywords.isEmpty()) {
+            return;
+        }
+
+        tableView.getSelectionModel().clearSelection();
+        for (int i = 0; i < progressRows.size(); i++) {
+            KeywordProgressRow row = progressRows.get(i);
+            if (row != null && selectedKeywords.contains(row.keyword())) {
+                tableView.getSelectionModel().select(i);
+            }
+        }
+
+        if (!tableView.getSelectionModel().getSelectedItems().isEmpty()) {
+            tableView.scrollTo(Math.max(0, tableView.getSelectionModel().getSelectedIndex()));
+        } else if (selectedIndex >= 0 && selectedIndex < progressRows.size()) {
+            tableView.scrollTo(selectedIndex);
+        }
+    }
+
+    private String formatProgressRowForCopy(KeywordProgressRow row) {
+        if (row == null) {
+            return "";
+        }
+        return String.format("[%03d] %s  %s  Progress: %s%s      Folder: %s%s      Message: %s%s      Start: %s | End: %s",
+            row.index(),
+            row.keyword(),
+            row.status(),
+            row.downloaded(),
+            System.lineSeparator(),
+            row.folder(),
+            System.lineSeparator(),
+            row.message(),
+            System.lineSeparator(),
+            row.startTime(),
+            row.endTime()
+        );
+    }
+
+    private void moveKeywordToTop(String keyword) {
+        if (keyword == null || keyword.isBlank()) {
+            return;
+        }
+        keywordIndexState.putIfAbsent(keyword, keywordIndexState.size() + 1);
+        keywordOrder.remove(keyword);
+        keywordOrder.add(0, keyword);
+    }
+
     private String extractKeyword(String line) {
-        Matcher matcher = KEYWORD_PATTERN.matcher(line);
+        Matcher runtimeMatcher = RUNTIME_LOG_PATTERN.matcher(line == null ? "" : line.trim());
+        if (runtimeMatcher.find()) {
+            return runtimeMatcher.group(1);
+        }
+        Matcher matcher = KEYWORD_PATTERN.matcher(line == null ? "" : line);
         return matcher.find() ? matcher.group(1) : null;
+    }
+
+    private String extractRuntimeStatus(String line) {
+        Matcher matcher = RUNTIME_LOG_PATTERN.matcher(line == null ? "" : line.trim());
+        return matcher.find() ? matcher.group(2) : null;
+    }
+
+    private String extractRuntimeTime(String line) {
+        String normalized = line == null ? "" : line.trim();
+        Matcher fullDateTime = Pattern.compile("^(\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2})").matcher(normalized);
+        if (fullDateTime.find()) {
+            return fullDateTime.group(1).replace('T', ' ');
+        }
+
+        Matcher timeOnly = Pattern.compile("^(\\d{2}:\\d{2}:\\d{2})").matcher(normalized);
+        if (timeOnly.find()) {
+            return timeOnly.group(1);
+        }
+
+        return LocalTime.now().format(PROGRESS_TIME_FORMAT);
+    }
+
+    private String extractRuntimeMessage(String line) {
+        Matcher matcher = RUNTIME_LOG_PATTERN.matcher(line == null ? "" : line.trim());
+        return matcher.find() ? matcher.group(3) : "";
+    }
+
+    private String messageForDisplay(String candidate, String fallback) {
+        if (candidate != null && !candidate.isBlank()) {
+            return candidate.trim();
+        }
+        if (fallback != null && !fallback.isBlank()) {
+            return fallback;
+        }
+        return "-";
+    }
+
+    private record KeywordProgressRow(
+        int index,
+        String keyword,
+        String status,
+        String downloaded,
+        String folder,
+        String message,
+        String startTime,
+        String endTime
+    ) {
+        private javafx.beans.property.SimpleStringProperty keywordDisplayProperty() {
+            return new javafx.beans.property.SimpleStringProperty(String.format("[%03d] %s", index, keyword));
+        }
+
+        private javafx.beans.property.SimpleStringProperty statusProperty() {
+            return new javafx.beans.property.SimpleStringProperty(status);
+        }
+
+        private javafx.beans.property.SimpleStringProperty downloadedProperty() {
+            return new javafx.beans.property.SimpleStringProperty(downloaded);
+        }
+
+        private javafx.beans.property.SimpleStringProperty folderProperty() {
+            return new javafx.beans.property.SimpleStringProperty(folder);
+        }
+
+        private javafx.beans.property.SimpleStringProperty messageProperty() {
+            return new javafx.beans.property.SimpleStringProperty(message);
+        }
+
+        private javafx.beans.property.SimpleStringProperty startTimeProperty() {
+            return new javafx.beans.property.SimpleStringProperty(startTime);
+        }
+
+        private javafx.beans.property.SimpleStringProperty endTimeProperty() {
+            return new javafx.beans.property.SimpleStringProperty(endTime);
+        }
+    }
+
+    private static Color statusColor(String status) {
+        return switch (status == null ? "" : status) {
+            case "RUNNING" -> Color.web("#2563eb");
+            case "SUCCESS" -> Color.web("#16a34a");
+            case "FAILED" -> Color.web("#dc2626");
+            case "STOPPED" -> Color.web("#d97706");
+            default -> Color.web("#64748b");
+        };
+    }
+
+    private static String statusColorHex(String status) {
+        return switch (status == null ? "" : status) {
+            case "RUNNING" -> "#2563eb";
+            case "SUCCESS" -> "#16a34a";
+            case "FAILED" -> "#dc2626";
+            case "STOPPED" -> "#d97706";
+            default -> "#64748b";
+        };
     }
 
     private static final class FolderItem {
@@ -2263,14 +3279,18 @@ public final class DownloaderFxApp extends Application {
 
     private static final class ClearStateItemCell extends ListCell<ClearStateItem> {
         private final CheckBox checkBox = new CheckBox();
-        private final Label label = new Label();
-        private final HBox content = new HBox(10, checkBox, label);
+        private final Label keywordLabel = new Label();
+        private final Label folderLabel = new Label();
+        private final HBox content = new HBox(10, checkBox, keywordLabel, folderLabel);
         private ClearStateItem bound;
 
         private ClearStateItemCell() {
             content.setAlignment(Pos.CENTER_LEFT);
-            label.setWrapText(true);
-            HBox.setHgrow(label, Priority.ALWAYS);
+            keywordLabel.setTextFill(Color.web("#0B5CAD"));
+            keywordLabel.setFont(Font.font(keywordLabel.getFont().getFamily(), FontWeight.BOLD, keywordLabel.getFont().getSize()));
+            folderLabel.setTextFill(Color.web("#6B7280"));
+            folderLabel.setMaxWidth(Double.MAX_VALUE);
+            HBox.setHgrow(folderLabel, Priority.ALWAYS);
             setContentDisplay(ContentDisplay.GRAPHIC_ONLY);
         }
 
@@ -2294,7 +3314,11 @@ public final class DownloaderFxApp extends Application {
             checkBox.selectedProperty().bindBidirectional(item.selectedProperty());
 
             RunStateStore.StateRecord record = item.record();
-            label.setText(valueOrDash(record == null ? null : record.keyword()));
+            keywordLabel.setText(valueOrDash(record == null ? null : record.keyword()));
+            folderLabel.setText(record == null ? "[No folder]" : folderDisplayPath(record.folderPath()));
+            setTooltip(record == null || record.folderPath() == null || record.folderPath().isBlank()
+                ? null
+                : new Tooltip(record.folderPath()));
             setGraphic(content);
         }
 

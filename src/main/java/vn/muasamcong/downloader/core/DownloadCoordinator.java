@@ -1,7 +1,6 @@
 package vn.muasamcong.downloader.core;
 
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -24,7 +23,8 @@ public final class DownloadCoordinator {
     private static final String BASE_URL = "https://muasamcong.mpi.gov.vn/";
     private static final int MAX_RETRIES = 2;
     private static final int DEFAULT_CONCURRENCY = 1;
-    private static final Path DEFAULT_DOWNLOAD_DIR = Paths.get("cache");
+    private static final int MAX_CONCURRENCY = 10;
+    private static final Path DEFAULT_DOWNLOAD_DIR = Utils.dataDirectory().resolve("cache");
     private static final Object EXECUTION_LOCK = new Object();
     private static volatile ExecutorService activePool;
     private static volatile AtomicBoolean activeStopFlag;
@@ -54,12 +54,17 @@ public final class DownloadCoordinator {
             );
         }
 
-        int normalizedConcurrency = Math.max(DEFAULT_CONCURRENCY, concurrency);
+        int normalizedConcurrency = Math.max(DEFAULT_CONCURRENCY, Math.min(MAX_CONCURRENCY, concurrency));
         Path tempDownloadDir = DEFAULT_DOWNLOAD_DIR;
+        SeleniumHelper.quitAllDriversNow();
+        Utils.logPlain("Pre-flight cleanup done: closed leftover Chrome/ChromeDriver sessions.");
         Utils.ensureDirectory(tempDownloadDir);
         DownloadWorker.prepareBidInfoOutput();
 
         Utils.logPlain("Loaded keywords: " + targets.size());
+        for (KeywordTarget target : targets) {
+            Utils.logPlain("Loaded keyword: " + target.keyword() + " folder=" + target.folderPath().toAbsolutePath());
+        }
         if (!forceRedownload) {
             int skipped = allTargets.size() - targets.size();
             Utils.logPlain("Skipped completed keywords: " + Math.max(0, skipped));
@@ -84,7 +89,7 @@ public final class DownloadCoordinator {
         }
 
         for (int i = 0; i < workerCount; i++) {
-            workers.add(new DownloadWorker(keywordQueue, BASE_URL, tempDownloadDir, MAX_RETRIES, stats, stopRequested));
+            workers.add(new DownloadWorker(keywordQueue, BASE_URL, tempDownloadDir, MAX_RETRIES, stats, stopRequested, i + 1));
         }
 
         workers.forEach(pool::submit);
@@ -111,6 +116,9 @@ public final class DownloadCoordinator {
         if (stopRequested.get()) {
             Utils.logPlain("Execution stopped by user.");
         } else {
+            if (stats.getProcessedRecords().isEmpty()) {
+                throw new IllegalStateException("No keyword was processed. Chrome profile may be locked by existing processes.");
+            }
             GoogleSheetsSyncService.syncFromJsonIfEnabled(Utils.dataFile("bid_sheet_rows.json"));
         }
 

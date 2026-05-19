@@ -12,10 +12,13 @@ public final class BidSheetRowBuilder {
     private String contractPerformanceFolder;
     private String parentFolderName;
     private BigInteger estimatedBudget;
+    private LocalDateTime postedDate;
+    private String packageExecutionTime;
     private BidStatus status;
     private LocalDateTime bidClosingTime;
     private Duration remainingTimeToClosing;
     private String folderLink;
+    private String tenderLink;
 
     private BidSheetRowBuilder() {
         // use factory methods
@@ -33,10 +36,13 @@ public final class BidSheetRowBuilder {
             .contractPerformanceFolder(source.contractPerformanceFolder())
             .parentFolderName(source.parentFolderName())
             .estimatedBudget(source.estimatedBudget())
+            .postedDate(source.postedDate())
+            .packageExecutionTime(source.packageExecutionTime())
             .status(source.status())
             .bidClosingTime(source.bidClosingTime())
             .remainingTimeToClosing(source.remainingTimeToClosing())
-            .folderLink(source.folderLink());
+            .folderLink(source.folderLink())
+            .tenderLink(source.tenderLink());
     }
 
     public BidSheetRowBuilder tmbtNumber(String tmbtNumber) {
@@ -69,6 +75,16 @@ public final class BidSheetRowBuilder {
         return this;
     }
 
+    public BidSheetRowBuilder postedDate(LocalDateTime postedDate) {
+        this.postedDate = postedDate;
+        return this;
+    }
+
+    public BidSheetRowBuilder packageExecutionTime(String packageExecutionTime) {
+        this.packageExecutionTime = packageExecutionTime;
+        return this;
+    }
+
     public BidSheetRowBuilder status(BidStatus status) {
         this.status = status;
         return this;
@@ -89,6 +105,11 @@ public final class BidSheetRowBuilder {
         return this;
     }
 
+    public BidSheetRowBuilder tenderLink(String tenderLink) {
+        this.tenderLink = tenderLink;
+        return this;
+    }
+
     public BidSheetRow build() {
         return new BidSheetRow(
             tmbtNumber,
@@ -97,10 +118,13 @@ public final class BidSheetRowBuilder {
             contractPerformanceFolder,
             parentFolderName,
             estimatedBudget,
+            postedDate,
+            packageExecutionTime,
             status,
             bidClosingTime,
             remainingTimeToClosing,
-            folderLink
+            folderLink,
+            tenderLink
         );
     }
 }
