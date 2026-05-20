@@ -28,6 +28,7 @@ import vn.muasamcong.downloader.model.BidSheetRow;
 import vn.muasamcong.downloader.model.BidSheetRowBuilder;
 import vn.muasamcong.downloader.model.BidStatus;
 import vn.muasamcong.downloader.model.KeywordTarget;
+import vn.muasamcong.downloader.store.BidTrackingRecordStore;
 import vn.muasamcong.downloader.store.RunStateStore;
 import vn.muasamcong.downloader.util.SeleniumHelper;
 import vn.muasamcong.downloader.util.Utils;
@@ -151,7 +152,9 @@ public final class DownloadWorker implements Runnable {
         + "//div[contains(@class,'infomation__content')]"
         + "[.//div[contains(@class,'infomation__content__title')]"
         + "[contains(normalize-space(),'Báo cáo đánh giá tổng hợp E-HSDT')"
-        + " or contains(normalize-space(),'Bao cao danh gia tong hop E-HSDT')]]"
+        + " or contains(normalize-space(),'Bao cao danh gia tong hop E-HSDT')"
+        + " or contains(normalize-space(),'Báo cáo đánh giá HSDT')"
+        + " or contains(normalize-space(),'Bao cao danh gia HSDT')]]"
         + "//*[contains(@class,'tags-fileAttach')]"
     );
     private static final By KQLCNT_WINNING_PRICE_EXCEL_BUTTON = By.xpath(
@@ -201,6 +204,17 @@ public final class DownloadWorker implements Runnable {
         synchronized (BID_INFO_JSON_LOCK) {
             Utils.ensureDirectory(BID_INFO_DATA_DIR);
             BID_INFO_ROWS.clear();
+            persistBidInfoRows();
+        }
+    }
+
+    public static void replaceBidInfoRows(Collection<BidSheetRow> rows) {
+        synchronized (BID_INFO_JSON_LOCK) {
+            Utils.ensureDirectory(BID_INFO_DATA_DIR);
+            BID_INFO_ROWS.clear();
+            if (rows != null) {
+                BID_INFO_ROWS.addAll(deduplicateRows(new ArrayList<>(rows)));
+            }
             persistBidInfoRows();
         }
     }
@@ -302,6 +316,7 @@ public final class DownloadWorker implements Runnable {
             .estimatedBudget(parseEstimatedBudgetValue(node.get("estimatedBudget")))
             .postedDate(postedDate)
             .packageExecutionTime(textValue(node, "packageExecutionTime"))
+            .winningBidPrice(parseEstimatedBudgetValue(node.get("winningBidPrice")))
             .status(status)
             .bidClosingTime(bidClosingTime)
             .remainingTimeToClosing(remaining)
@@ -518,15 +533,14 @@ public final class DownloadWorker implements Runnable {
         String keyword = target.keyword();
         int expectedDownloadCount = 0;
         int downloadedCount = 0;
-        Path autoDownloadFolder = resolveAutoDownloadFolder(target);
 
         // ── Step 1: Search → open detail page ───────────────────────────────
         navigateToDetailPage(driver, keyword);
 
-        // ── Step 2: Trích xuất thông tin gói thầu (tab TBMT active mặc định) ─
-        BidSheetRow bidInfo = extractBidInfo(driver, keyword);
+        // Store stable API params for later monitor/API-based sheet sync.
+        BidTrackingRecordStore.upsertFromDetailUrl(target, driver.getCurrentUrl());
         Utils.logStatus(keyword, "INFO", 0,
-            "Bid info extracted.");
+            "Bid tracking record saved.");
 
         int tenderNoticeAttachmentCount = downloadTenderNoticeAttachments(driver, downloadDir, target, keyword);
         expectedDownloadCount += tenderNoticeAttachmentCount;
@@ -534,48 +548,25 @@ public final class DownloadWorker implements Runnable {
 
         boolean hasBbmtTab = hasTab(driver, TAB_BID_OPENING_MINUTES);
         boolean hasKqlcntTab = hasTab(driver, TAB_CONTRACTOR_SELECTION_RESULTS);
-        boolean hasContractInfoTab = hasAnyTab(driver, TAB_CONTRACT_INFORMATION_ALIASES)
-            || hasTabByHrefTargetId(driver, "contract");
 
-        // ── Step 3: Tab "Biên bản mở thầu" (tuỳ chọn) ──────────────────────
-        Path bbmtPdf = null;
+        // ── Step 2: Tab "Biên bản mở thầu" (tuỳ chọn) ──────────────────────
         if (hasBbmtTab) {
             expectedDownloadCount++;
             Utils.logStatus(keyword, "INFO", 0, "Tab 'Biên bản mở thầu' found -> clicking...");
             clickTab(driver, TAB_BID_OPENING_MINUTES);
             waitForBbmtInfoReady(driver);
-
-            String budgetFromBbmtRaw = readInfoValueByLabelsFromRenderedDom(
-                driver, BBMT_INFO_PANE, INFO_LABELS.get("estimatedBudget"));
-            Utils.logStatus(keyword, "INFO", 0,
-                "Read Dự toán gói thầu from tab 'Biên bản mở thầu': "
-                + (budgetFromBbmtRaw == null || budgetFromBbmtRaw.isBlank() ? "<empty>" : budgetFromBbmtRaw));
-            logBbmtMoneyFields(driver, keyword);
-            BigInteger budgetFromBbmt = parseEstimatedBudget(budgetFromBbmtRaw, keyword);
-            if (budgetFromBbmt != null) {
-                bidInfo = BidSheetRowBuilder.from(bidInfo)
-                    .estimatedBudget(budgetFromBbmt)
-                    .build();
-                Utils.logStatus(keyword, "INFO", 0,
-                    "Extracted estimatedBudget from tab 'Biên bản mở thầu': " + formatBudget(budgetFromBbmt));
-            } else {
-                Utils.logStatus(keyword, "INFO", 0,
-                    "Dự toán gói thầu not found in tab 'Biên bản mở thầu'.");
-            }
-
-            bbmtPdf = downloadBbmtPdf(driver, downloadDir, target, keyword);
+            downloadBbmtPdf(driver, downloadDir, target, keyword);
             downloadedCount++;
         } else {
             Utils.logStatus(keyword, "INFO", 0, "Tab 'Biên bản mở thầu' not present. Skipping.");
         }
 
-        // ── Step 4: Tab "Kết quả lựa chọn nhà thầu" (tuỳ chọn) ─────────────
-        Path kqlcntPdf = null;
+        // ── Step 3: Tab "Kết quả lựa chọn nhà thầu" (tuỳ chọn) ─────────────
         if (hasKqlcntTab) {
             expectedDownloadCount++;
             Utils.logStatus(keyword, "INFO", 0, "Tab 'Kết quả lựa chọn nhà thầu' found -> clicking...");
             clickTab(driver, TAB_CONTRACTOR_SELECTION_RESULTS);
-            kqlcntPdf = downloadKqlcntDecision(driver, downloadDir, target, keyword);
+            downloadKqlcntDecision(driver, downloadDir, target, keyword);
             downloadedCount++;
 
             expectedDownloadCount++;
@@ -602,42 +593,6 @@ public final class DownloadWorker implements Runnable {
                 "Downloaded files mismatch: " + downloadedCount + "/" + expectedDownloadCount);
         }
 
-        Path selectedPdf = bbmtPdf != null ? bbmtPdf : kqlcntPdf;
-        String contractFolderName = target.folderPath().getFileName() != null
-            ? target.folderPath().getFileName().toString()
-            : target.folderPath().toAbsolutePath().toString();
-        String parentFolderName = target.folderPath().getParent() != null && target.folderPath().getParent().getFileName() != null
-            ? target.folderPath().getParent().getFileName().toString()
-            : null;
-        String folderLink = selectedPdf != null && selectedPdf.getParent() != null
-            ? selectedPdf.getParent().toAbsolutePath().toString()
-            : autoDownloadFolder.toAbsolutePath().toString();
-        Duration remainingTime = bidInfo.remainingTimeToClosing();
-        BidStatus status;
-        if (hasContractInfoTab) {
-            status = BidStatus.CONTRACT_INFORMATION_AVAILABLE;
-        } else if (hasKqlcntTab) {
-            status = BidStatus.CONTRACTOR_SELECTION_RESULT_AVAILABLE;
-        } else if (hasBbmtTab) {
-            status = BidStatus.BID_OPENED;
-        } else if (remainingTime != null && remainingTime.getSeconds() > 0) {
-            status = BidStatus.INVITATION_OPEN;
-        } else {
-            status = BidStatus.BIDDING_CLOSED;
-        }
-
-        BidSheetRow rowToExport = BidSheetRowBuilder.from(bidInfo)
-            .contractPerformanceFolder(contractFolderName)
-            .parentFolderName(parentFolderName)
-            .status(status)
-            .folderLink(folderLink)
-            .build();
-
-        exportBidInfoJson(rowToExport, keyword);
-        if (downloadedCount == 0) {
-            Utils.logStatus(keyword, "INFO", 0,
-                "Keyword exported to bid_sheet_rows with 0 downloaded files.");
-        }
         return downloadedCount;
     }
 
@@ -1545,19 +1500,19 @@ public final class DownloadWorker implements Runnable {
         for (int attempt = 1; attempt <= attempts; attempt++) {
             try {
                 Utils.logStatus(keyword, "INFO", attempt,
-                    "KQLCNT: locating E-HSDT evaluation report attachment.");
+                    "KQLCNT: locating HSDT/E-HSDT evaluation report attachment.");
                 Set<Path> before = Utils.snapshotPdfFiles(downloadDir);
                 long clickStartedAt = System.nanoTime();
                 long clickStartedAtMs = System.currentTimeMillis();
                 clickFirstDownloadTrigger(driver, reportTriggers, Duration.ofSeconds(15));
                 Utils.logStatus(keyword, "INFO", attempt,
-                    "KQLCNT E-HSDT report trigger clicked. Waiting for file to appear...");
+                    "KQLCNT evaluation report trigger clicked. Waiting for file to appear...");
                 SeleniumHelper.normalizeWindows(driver,
                     url -> url.toLowerCase().contains("render=detail-v2"));
 
                 if (SeleniumHelper.isDisposableCurrentUrl(driver)) {
                     throw new IllegalStateException(
-                        "Browser navigated away after KQLCNT E-HSDT report click: "
+                        "Browser navigated away after KQLCNT evaluation report click: "
                         + driver.getCurrentUrl());
                 }
 
@@ -1571,35 +1526,35 @@ public final class DownloadWorker implements Runnable {
                     if (fallback != null) {
                         downloaded = fallback;
                         Utils.logStatus(keyword, "WARN", attempt,
-                            "KQLCNT E-HSDT report timeout fallback matched file: " + fallback.getFileName());
+                            "KQLCNT evaluation report timeout fallback matched file: " + fallback.getFileName());
                     } else {
                         throw new TimeoutException(
-                            "Download timeout waiting for KQLCNT Báo cáo đánh giá tổng hợp E-HSDT file.");
+                            "Download timeout waiting for KQLCNT evaluation report file.");
                     }
                 }
                 if (!Utils.isNonEmptyRegularFile(downloaded)) {
                     throw new IllegalStateException(
-                        "Downloaded KQLCNT E-HSDT report file is invalid or empty: " + downloaded);
+                        "Downloaded KQLCNT evaluation report file is invalid or empty: " + downloaded);
                 }
 
                 Path finalFile = Utils.moveFileToTargetFolder(downloaded, resolveAutoDownloadFolder(target));
                 long elapsedMs = (System.nanoTime() - clickStartedAt) / 1_000_000L;
                 Utils.logStatus(keyword, "INFO", attempt,
-                    "KQLCNT E-HSDT report file saved: " + finalFile.getFileName() + " | waitMs=" + elapsedMs);
+                    "KQLCNT evaluation report file saved: " + finalFile.getFileName() + " | waitMs=" + elapsedMs);
                 return finalFile;
             } catch (StaleElementReferenceException ex) {
                 lastError = ex;
                 Utils.logStatus(keyword, "WARN", attempt,
-                    "KQLCNT E-HSDT report attachment changed while clicking. Retrying...");
+                    "KQLCNT evaluation report attachment changed while clicking. Retrying...");
             } catch (RuntimeException ex) {
                 lastError = ex;
                 Utils.logStatus(keyword, "WARN", attempt,
-                    "KQLCNT E-HSDT report download attempt failed: " + rootMessage(ex));
+                    "KQLCNT evaluation report download attempt failed: " + rootMessage(ex));
             }
         }
 
         throw lastError == null
-            ? new IllegalStateException("KQLCNT E-HSDT report download failed after retry attempts.")
+            ? new IllegalStateException("KQLCNT evaluation report download failed after retry attempts.")
             : lastError;
     }
 
@@ -1910,6 +1865,7 @@ public final class DownloadWorker implements Runnable {
             + "  \"estimatedBudget\": " + quoteJson(estimatedBudget) + ",\n"
             + "  \"postedDate\": " + quoteJson(postedDate) + ",\n"
             + "  \"packageExecutionTime\": " + quoteJson(row.packageExecutionTime()) + ",\n"
+            + "  \"winningBidPrice\": " + quoteJson(row.winningBidPrice() == null ? null : row.winningBidPrice().toString()) + ",\n"
             + "  \"status\": " + (row.status() == null ? "null" : quoteJson(row.status().name())) + ",\n"
             + "  \"bidClosingTime\": " + quoteJson(bidClosing) + ",\n"
             + "  \"remainingTimeSeconds\": " + (remainingSeconds == null ? "null" : remainingSeconds) + ",\n"

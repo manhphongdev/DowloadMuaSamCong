@@ -37,10 +37,12 @@ public final class GoogleSheetsSyncService {
     private static final String INDEX_SHEET_NAME = "MucLuc";
     private static final String DATA_RANGE_START_A1 = "A1";
     private static final String INDEX_DATA_RANGE_START_A1 = "A1";
+    private static final String INDEX_SUMMARY_RANGE_START_A1 = "I1";
     private static final Pattern FOLDER_ORDER_PATTERN = Pattern.compile("^\\s*(\\d+)\\s*\\.");
-    private static final int STATUS_COLUMN_INDEX = 7; // column H, zero-based
-    private static final int REMAINING_COLUMN_INDEX = 9; // column J, zero-based
-    private static final int TOTAL_COLUMN_COUNT = 11; // A..K
+    private static final Pattern KEYWORD_FOLDER_PATTERN = Pattern.compile("^\\s*\\d+\\s*\\.\\s*IB[A-Za-z0-9]+(?=\\.|\\s|$)", Pattern.CASE_INSENSITIVE);
+    private static final int STATUS_COLUMN_INDEX = 8; // column I, zero-based
+    private static final int REMAINING_COLUMN_INDEX = 10; // column K, zero-based
+    private static final int TOTAL_COLUMN_COUNT = 12; // A..L
     private static final DateTimeFormatter INDEX_TIME_FORMAT = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
     private static final List<String> OUTPUT_HEADERS = List.of(
         "Số TBMT",
@@ -50,6 +52,7 @@ public final class GoogleSheetsSyncService {
         "Dự toán",
         "Ngày đăng tải",
         "Thời gian thực hiện gói thầu",
+        "Giá trúng thầu",
         "Trạng thái",
         "Thời điểm đóng thầu",
         "Còn lại",
@@ -59,6 +62,7 @@ public final class GoogleSheetsSyncService {
         "STT",
         "Tên Sheet",
         "Tổng số gói thầu",
+        "Tỷ lệ scrape",
         "Tóm tắt trạng thái",
         "Cập nhật lúc",
         "Điều hướng"
@@ -169,6 +173,7 @@ public final class GoogleSheetsSyncService {
             .estimatedBudget(parseEstimatedBudget(node.get("estimatedBudget")))
             .postedDate(postedDate)
             .packageExecutionTime(textValue(node, "packageExecutionTime"))
+            .winningBidPrice(parseEstimatedBudget(node.get("winningBidPrice")))
             .status(status)
             .bidClosingTime(bidClosingTime)
             .remainingTimeToClosing(remaining)
@@ -237,6 +242,7 @@ public final class GoogleSheetsSyncService {
             sheetOverviews.add(new SheetOverview(
                 sheetName,
                 sheetRows.size(),
+                totalPackageCount(sheetRows),
                 buildStatusSummary(sheetRows),
                 navigationLink
             ));
@@ -329,6 +335,13 @@ public final class GoogleSheetsSyncService {
             accessToken,
             "USER_ENTERED"
         );
+        updateSingleRange(
+            spreadsheetId,
+            toSheetA1Prefix(INDEX_SHEET_NAME) + "!" + INDEX_SUMMARY_RANGE_START_A1,
+            buildIndexSummaryValues(sortedOverviews),
+            accessToken,
+            "USER_ENTERED"
+        );
         applyIndexSheetPresentation(spreadsheetId, accessToken, Math.max(1, sortedOverviews.size() + 1), sortedOverviews);
     }
 
@@ -342,7 +355,8 @@ public final class GoogleSheetsSyncService {
             values.add(List.of(
                 Integer.toString(stt),
                 safeText(overview.sheetName()),
-                Integer.toString(Math.max(0, overview.totalRows())),
+                scrapeCountLabel(overview.scrapedRows(), overview.totalPackages()),
+                scrapePercentLabel(overview.scrapedRows(), overview.totalPackages()),
                 safeText(overview.statusSummary()),
                 updatedAt,
                 overview.navigationLink() == null || overview.navigationLink().isBlank() ? "" : "Mo sheet"
@@ -350,6 +364,70 @@ public final class GoogleSheetsSyncService {
             stt++;
         }
         return values;
+    }
+
+    private static List<List<Object>> buildIndexSummaryValues(List<SheetOverview> sheetOverviews) {
+        int scraped = 0;
+        int total = 0;
+        if (sheetOverviews != null) {
+            for (SheetOverview overview : sheetOverviews) {
+                scraped += Math.max(0, overview.scrapedRows());
+                total += Math.max(0, overview.totalPackages());
+            }
+        }
+        return List.of(
+            List.of("Tiến độ scrape", scrapePercentLabel(scraped, total)),
+            List.of("Đã scrape", Integer.toString(scraped)),
+            List.of("Tổng gói", Integer.toString(total)),
+            List.of("Tỷ lệ", scrapeCountLabel(scraped, total))
+        );
+    }
+
+    private static String scrapeCountLabel(int scrapedRows, int totalPackages) {
+        int scraped = Math.max(0, scrapedRows);
+        int total = Math.max(scraped, totalPackages);
+        return scraped + "/" + total;
+    }
+
+    private static String scrapePercentLabel(int scrapedRows, int totalPackages) {
+        int scraped = Math.max(0, scrapedRows);
+        int total = Math.max(scraped, totalPackages);
+        if (total <= 0) {
+            return "0%";
+        }
+        int percent = (int) Math.round((scraped * 100.0) / total);
+        return percent + "%";
+    }
+
+    private static int totalPackageCount(List<BidSheetRow> rows) {
+        int scraped = rows == null ? 0 : rows.size();
+        if (rows == null || rows.isEmpty()) {
+            return scraped;
+        }
+        for (BidSheetRow row : rows) {
+            String folderLink = row == null ? null : row.folderLink();
+            if (folderLink == null || folderLink.isBlank()) {
+                continue;
+            }
+            try {
+                Path folder = Path.of(folderLink).toAbsolutePath().normalize();
+                Path parent = folder.getParent();
+                if (parent == null || !Files.isDirectory(parent)) {
+                    continue;
+                }
+                try (var children = Files.list(parent)) {
+                    long count = children
+                        .filter(Files::isDirectory)
+                        .map(path -> path.getFileName() == null ? "" : path.getFileName().toString())
+                        .filter(name -> KEYWORD_FOLDER_PATTERN.matcher(name).find())
+                        .count();
+                    return (int) Math.max(scraped, count);
+                }
+            } catch (Exception ignored) {
+                // Use scraped count if the source folder is not available.
+            }
+        }
+        return scraped;
     }
 
     private static List<SheetOverview> sortSheetOverviews(List<SheetOverview> sheetOverviews) {
@@ -433,7 +511,7 @@ public final class GoogleSheetsSyncService {
                 int startColumn = range.path("startColumnIndex").asInt(0);
                 int endColumn = range.path("endColumnIndex").asInt(0);
                 int startRow = range.path("startRowIndex").asInt(0);
-                if (startRow == 0 && startColumn == 0 && endColumn == 6) {
+                if (startRow == 0 && startColumn == 0 && endColumn == 7) {
                     int bandedRangeId = bandedRange.path("bandedRangeId").asInt(-1);
                     if (bandedRangeId > 0) {
                         requests.add(Map.of(
@@ -456,9 +534,12 @@ public final class GoogleSheetsSyncService {
         requests.add(columnWidthRequest(sheetId, 0, 70));
         requests.add(columnWidthRequest(sheetId, 1, 300));
         requests.add(columnWidthRequest(sheetId, 2, 165));
-        requests.add(columnWidthRequest(sheetId, 3, 500));
-        requests.add(columnWidthRequest(sheetId, 4, 210));
-        requests.add(columnWidthRequest(sheetId, 5, 250));
+        requests.add(columnWidthRequest(sheetId, 3, 120));
+        requests.add(columnWidthRequest(sheetId, 4, 500));
+        requests.add(columnWidthRequest(sheetId, 5, 210));
+        requests.add(columnWidthRequest(sheetId, 6, 250));
+        requests.add(columnWidthRequest(sheetId, 8, 180));
+        requests.add(columnWidthRequest(sheetId, 9, 180));
 
         requests.add(Map.of(
             "setBasicFilter", Map.of(
@@ -468,7 +549,7 @@ public final class GoogleSheetsSyncService {
                         "startRowIndex", 0,
                         "endRowIndex", rowCount,
                         "startColumnIndex", 0,
-                        "endColumnIndex", 6
+                        "endColumnIndex", 7
                     )
                 )
             )
@@ -481,7 +562,7 @@ public final class GoogleSheetsSyncService {
                     "startRowIndex", 0,
                     "endRowIndex", 1,
                     "startColumnIndex", 0,
-                    "endColumnIndex", 6
+                    "endColumnIndex", 7
                 ),
                 "cell", Map.of(
                     "userEnteredFormat", Map.of(
@@ -503,7 +584,7 @@ public final class GoogleSheetsSyncService {
                     "startRowIndex", 1,
                     "endRowIndex", rowCount,
                     "startColumnIndex", 0,
-                    "endColumnIndex", 6
+                    "endColumnIndex", 7
                 ),
                 "cell", Map.of(
                     "userEnteredFormat", Map.of(
@@ -557,8 +638,26 @@ public final class GoogleSheetsSyncService {
                     "sheetId", sheetId,
                     "startRowIndex", 1,
                     "endRowIndex", rowCount,
-                    "startColumnIndex", 4,
-                    "endColumnIndex", 5
+                    "startColumnIndex", 3,
+                    "endColumnIndex", 4
+                ),
+                "cell", Map.of(
+                    "userEnteredFormat", Map.of(
+                        "horizontalAlignment", "CENTER"
+                    )
+                ),
+                "fields", "userEnteredFormat.horizontalAlignment"
+            )
+        ));
+
+        requests.add(Map.of(
+            "repeatCell", Map.of(
+                "range", Map.of(
+                    "sheetId", sheetId,
+                    "startRowIndex", 1,
+                    "endRowIndex", rowCount,
+                    "startColumnIndex", 5,
+                    "endColumnIndex", 6
                 ),
                 "cell", Map.of(
                     "userEnteredFormat", Map.of(
@@ -577,7 +676,7 @@ public final class GoogleSheetsSyncService {
                         "startRowIndex", 0,
                         "endRowIndex", rowCount,
                         "startColumnIndex", 0,
-                        "endColumnIndex", 6
+                        "endColumnIndex", 7
                     ),
                     "rowProperties", Map.of(
                         "headerColor", color(0.87, 0.92, 0.98),
@@ -594,7 +693,7 @@ public final class GoogleSheetsSyncService {
                     "startRowIndex", 0,
                     "endRowIndex", rowCount,
                     "startColumnIndex", 0,
-                    "endColumnIndex", 6
+                    "endColumnIndex", 7
                 ),
                 "top", Map.of("style", "SOLID", "width", 1, "color", color(0.80, 0.82, 0.85)),
                 "bottom", Map.of("style", "SOLID", "width", 1, "color", color(0.80, 0.82, 0.85)),
@@ -606,6 +705,7 @@ public final class GoogleSheetsSyncService {
         ));
 
         addIndexNavigationLinkRequests(requests, sheetId, sheetOverviews);
+        addIndexSummaryCardRequests(requests, sheetId);
 
         String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + ":batchUpdate";
         String payload = OBJECT_MAPPER.writeValueAsString(Map.of("requests", requests));
@@ -617,6 +717,82 @@ public final class GoogleSheetsSyncService {
 
         HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         ensureOk(response, "apply index sheet presentation");
+    }
+
+    private static void addIndexSummaryCardRequests(List<Map<String, Object>> requests, int sheetId) {
+        requests.add(Map.of(
+            "repeatCell", Map.of(
+                "range", Map.of(
+                    "sheetId", sheetId,
+                    "startRowIndex", 0,
+                    "endRowIndex", 4,
+                    "startColumnIndex", 8,
+                    "endColumnIndex", 10
+                ),
+                "cell", Map.of(
+                    "userEnteredFormat", Map.of(
+                        "backgroundColor", color(0.95, 0.98, 0.95),
+                        "verticalAlignment", "MIDDLE",
+                        "wrapStrategy", "WRAP"
+                    )
+                ),
+                "fields", "userEnteredFormat(backgroundColor,verticalAlignment,wrapStrategy)"
+            )
+        ));
+        requests.add(Map.of(
+            "repeatCell", Map.of(
+                "range", Map.of(
+                    "sheetId", sheetId,
+                    "startRowIndex", 0,
+                    "endRowIndex", 1,
+                    "startColumnIndex", 8,
+                    "endColumnIndex", 10
+                ),
+                "cell", Map.of(
+                    "userEnteredFormat", Map.of(
+                        "backgroundColor", color(0.78, 0.91, 0.80),
+                        "textFormat", Map.of("bold", true),
+                        "horizontalAlignment", "CENTER"
+                    )
+                ),
+                "fields", "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
+            )
+        ));
+        requests.add(Map.of(
+            "repeatCell", Map.of(
+                "range", Map.of(
+                    "sheetId", sheetId,
+                    "startRowIndex", 0,
+                    "endRowIndex", 4,
+                    "startColumnIndex", 9,
+                    "endColumnIndex", 10
+                ),
+                "cell", Map.of(
+                    "userEnteredFormat", Map.of(
+                        "textFormat", Map.of("bold", true),
+                        "horizontalAlignment", "CENTER"
+                    )
+                ),
+                "fields", "userEnteredFormat(textFormat,horizontalAlignment)"
+            )
+        ));
+        requests.add(Map.of(
+            "updateBorders", Map.of(
+                "range", Map.of(
+                    "sheetId", sheetId,
+                    "startRowIndex", 0,
+                    "endRowIndex", 4,
+                    "startColumnIndex", 8,
+                    "endColumnIndex", 10
+                ),
+                "top", Map.of("style", "SOLID", "width", 1, "color", color(0.55, 0.70, 0.57)),
+                "bottom", Map.of("style", "SOLID", "width", 1, "color", color(0.55, 0.70, 0.57)),
+                "left", Map.of("style", "SOLID", "width", 1, "color", color(0.55, 0.70, 0.57)),
+                "right", Map.of("style", "SOLID", "width", 1, "color", color(0.55, 0.70, 0.57)),
+                "innerHorizontal", Map.of("style", "SOLID", "width", 1, "color", color(0.80, 0.88, 0.80)),
+                "innerVertical", Map.of("style", "SOLID", "width", 1, "color", color(0.80, 0.88, 0.80))
+            )
+        ));
     }
 
     private static void addIndexNavigationLinkRequests(
@@ -651,7 +827,7 @@ public final class GoogleSheetsSyncService {
                 "start", Map.of(
                     "sheetId", sheetId,
                     "rowIndex", 1,
-                    "columnIndex", 5
+                    "columnIndex", 6
                 ),
                 "rows", rows,
                 "fields", "userEnteredValue,userEnteredFormat.textFormat"
@@ -661,7 +837,8 @@ public final class GoogleSheetsSyncService {
 
     private record SheetOverview(
         String sheetName,
-        int totalRows,
+        int scrapedRows,
+        int totalPackages,
         String statusSummary,
         String navigationLink
     ) {
@@ -1425,6 +1602,7 @@ public final class GoogleSheetsSyncService {
                 estimatedBudgetValue(row.estimatedBudget()),
                 safeText(formatDateTime(row.postedDate())),
                 safeText(row.packageExecutionTime()),
+                estimatedBudgetValue(row.winningBidPrice()),
                 safeText(toStatusLabel(row.status())),
                 safeText(formatDateTime(row.bidClosingTime())),
                 safeText(formatRemaining(row.remainingTimeToClosing())),

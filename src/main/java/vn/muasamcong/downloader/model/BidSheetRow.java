@@ -14,6 +14,7 @@ public record BidSheetRow(
     BigInteger estimatedBudget, // du toan
     LocalDateTime postedDate,
     String packageExecutionTime,
+    BigInteger winningBidPrice,
     BidStatus status,
     LocalDateTime bidClosingTime,
     Duration remainingTimeToClosing,
@@ -31,6 +32,7 @@ public record BidSheetRow(
             "Estimated Budget",
             "Posted Date",
             "Package Execution Time",
+            "Winning Bid Price",
             "Status",
             "Bid Closing Time",
             "Remaining Time To Closing",

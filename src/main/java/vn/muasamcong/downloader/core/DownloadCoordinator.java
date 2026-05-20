@@ -10,6 +10,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import vn.muasamcong.downloader.export.BidSheetApiSyncService;
 import vn.muasamcong.downloader.export.GoogleSheetsSyncService;
 import vn.muasamcong.downloader.model.KeywordTarget;
 import vn.muasamcong.downloader.parser.FolderKeywordReader;
@@ -119,6 +120,8 @@ public final class DownloadCoordinator {
             if (stats.getProcessedRecords().isEmpty()) {
                 throw new IllegalStateException("No keyword was processed. Chrome profile may be locked by existing processes.");
             }
+            int rowCount = BidSheetApiSyncService.refreshBidSheetRowsFromTracking();
+            Utils.logPlain("Bid sheet rows refreshed from API. Rows: " + rowCount);
             GoogleSheetsSyncService.syncFromJsonIfEnabled(Utils.dataFile("bid_sheet_rows.json"));
         }
 

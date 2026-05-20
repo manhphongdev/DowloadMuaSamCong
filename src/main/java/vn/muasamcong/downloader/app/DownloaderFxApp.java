@@ -90,8 +90,10 @@ import javafx.stage.Modality;
 import javafx.stage.Stage;
 import vn.muasamcong.downloader.core.DownloadCoordinator;
 import vn.muasamcong.downloader.core.RunStats;
+import vn.muasamcong.downloader.export.BidSheetApiSyncService;
 import vn.muasamcong.downloader.export.GoogleSheetsSyncService;
 import vn.muasamcong.downloader.store.AutoRunConfigStore;
+import vn.muasamcong.downloader.store.BidTrackingRecordStore;
 import vn.muasamcong.downloader.store.BrowserProfileConfigStore;
 import vn.muasamcong.downloader.store.FolderSelectionStore;
 import vn.muasamcong.downloader.store.GoogleSheetsConfigStore;
@@ -1543,12 +1545,6 @@ public final class DownloaderFxApp extends Application {
     }
 
     private void handleExportGoogleSheet() {
-        if (!Files.exists(BID_ROWS_JSON_FILE)) {
-            updateStatus("Export failed", "status-error");
-            addDetailLog("No data found to export: " + BID_ROWS_JSON_FILE);
-            return;
-        }
-
         exportSheetButton.setDisable(true);
         updateStatus("Syncing sheet...", "status-running");
         addDetailLog("Exporting data to Google Sheets...");
@@ -1556,6 +1552,10 @@ public final class DownloaderFxApp extends Application {
         Task<Void> task = new Task<>() {
             @Override
             protected Void call() throws Exception {
+                BidSheetApiSyncService.refreshBidSheetRowsFromTracking();
+                if (!Files.exists(BID_ROWS_JSON_FILE)) {
+                    throw new IllegalStateException("No data found to export: " + BID_ROWS_JSON_FILE);
+                }
                 GoogleSheetsSyncService.syncFromJsonNow(BID_ROWS_JSON_FILE);
                 return null;
             }
@@ -1677,9 +1677,13 @@ public final class DownloaderFxApp extends Application {
             }
 
             int removed = RunStateStore.removeByKeys(keys);
+            int removedTrackingRecords = BidTrackingRecordStore.removeByKeys(keys);
             int removedRows = DownloadWorker.removeBidInfoRowsByStateRecords(selectedRecords);
             updateStatus("State removed: " + removed, "status-success");
             addDetailLog("Removed " + removed + " state records.");
+            if (removedTrackingRecords > 0) {
+                addDetailLog("Removed " + removedTrackingRecords + " bid tracking record(s).");
+            }
             if (removedRows > 0) {
                 addDetailLog("Removed " + removedRows + " row(s) from bid_sheet_rows.json.");
                 updateReportFromConfig();
@@ -1703,12 +1707,13 @@ public final class DownloaderFxApp extends Application {
             try {
                 RunStateStore.clear();
                 RunHistoryStore.clear();
+                BidTrackingRecordStore.clear();
                 DownloadWorker.clearBidInfoOutput();
                 updateReportFromConfig();
                 clearRunData();
                 refreshProgressView();
                 updateStatus("Run state cleared", "status-success");
-                addDetailLog("run_state.json, run_history and bid_sheet_rows.json were cleared.");
+                addDetailLog("run_state.json, run_history, bid_tracking_records.json and bid_sheet_rows.json were cleared.");
                 dialog.close();
             } catch (Exception ex) {
                 updateStatus("Clear state failed", "status-error");

@@ -14,6 +14,7 @@ public final class BidSheetRowBuilder {
     private BigInteger estimatedBudget;
     private LocalDateTime postedDate;
     private String packageExecutionTime;
+    private BigInteger winningBidPrice;
     private BidStatus status;
     private LocalDateTime bidClosingTime;
     private Duration remainingTimeToClosing;
@@ -38,6 +39,7 @@ public final class BidSheetRowBuilder {
             .estimatedBudget(source.estimatedBudget())
             .postedDate(source.postedDate())
             .packageExecutionTime(source.packageExecutionTime())
+            .winningBidPrice(source.winningBidPrice())
             .status(source.status())
             .bidClosingTime(source.bidClosingTime())
             .remainingTimeToClosing(source.remainingTimeToClosing())
@@ -85,6 +87,11 @@ public final class BidSheetRowBuilder {
         return this;
     }
 
+    public BidSheetRowBuilder winningBidPrice(BigInteger winningBidPrice) {
+        this.winningBidPrice = winningBidPrice;
+        return this;
+    }
+
     public BidSheetRowBuilder status(BidStatus status) {
         this.status = status;
         return this;
@@ -120,6 +127,7 @@ public final class BidSheetRowBuilder {
             estimatedBudget,
             postedDate,
             packageExecutionTime,
+            winningBidPrice,
             status,
             bidClosingTime,
             remainingTimeToClosing,
