@@ -3,11 +3,6 @@ package vn.muasamcong.downloader.app;
 import java.awt.Desktop;
 import java.io.IOException;
 import java.net.URI;
-import java.net.URLDecoder;
-import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Files;
@@ -93,14 +88,20 @@ import vn.muasamcong.downloader.core.RunStats;
 import vn.muasamcong.downloader.export.BidSheetApiSyncService;
 import vn.muasamcong.downloader.export.GoogleSheetsSyncService;
 import vn.muasamcong.downloader.store.AutoRunConfigStore;
+import vn.muasamcong.downloader.store.ArtifactFingerprintStore;
 import vn.muasamcong.downloader.store.BidTrackingRecordStore;
 import vn.muasamcong.downloader.store.BrowserProfileConfigStore;
 import vn.muasamcong.downloader.store.FolderSelectionStore;
 import vn.muasamcong.downloader.store.GoogleSheetsConfigStore;
+import vn.muasamcong.downloader.store.MonitorKeywordStore;
 import vn.muasamcong.downloader.store.RunStateStore;
 import vn.muasamcong.downloader.store.RunHistoryStore;
 import vn.muasamcong.downloader.store.UpdateConfigStore;
 import vn.muasamcong.downloader.core.DownloadWorker;
+import vn.muasamcong.downloader.model.MonitorDownloadStatus;
+import vn.muasamcong.downloader.model.MonitorKeywordRecord;
+import vn.muasamcong.downloader.model.KeywordTarget;
+import vn.muasamcong.downloader.parser.FolderKeywordReader;
 import vn.muasamcong.downloader.update.UpdateInfo;
 import vn.muasamcong.downloader.update.UpdateService;
 import vn.muasamcong.downloader.util.Utils;
@@ -114,12 +115,6 @@ public final class DownloaderFxApp extends Application {
     private static final Pattern LOADED_KEYWORD_PATTERN = Pattern.compile("^Loaded keyword:\\s+(\\S+)\\s+folder=(.*)$");
     private static final Pattern DOWNLOADED_FILES_PATTERN = Pattern.compile("Downloaded files:\\s*(\\d+)\\s*/\\s*(\\d+)");
     private static final Path BID_ROWS_JSON_FILE = Utils.dataFile("bid_sheet_rows.json").toAbsolutePath().normalize();
-    private static final String TEST_DOWNLOAD_ENDPOINT =
-        "http://localhost:1234/api/download/file/browser/public";
-    private static final HttpClient TEST_DOWNLOAD_HTTP_CLIENT = HttpClient.newBuilder()
-        .followRedirects(HttpClient.Redirect.NORMAL)
-        .connectTimeout(Duration.ofSeconds(10))
-        .build();
     private static final DateTimeFormatter NEXT_RUN_FORMAT = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
     private static final DateTimeFormatter LOG_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter PROGRESS_TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm:ss");
@@ -140,7 +135,6 @@ public final class DownloaderFxApp extends Application {
     private Button expandProgressButton;
     private Button clearStateButton;
     private Button sheetsConfigButton;
-    private Button testDownloadButton;
     private Button saveUpdateConfigButton;
     private Button checkUpdateButton;
     private Button downloadUpdateButton;
@@ -149,6 +143,10 @@ public final class DownloaderFxApp extends Application {
     private Button saveBrowserProfileButton;
     private CheckBox autoCheckUpdateOnStartupCheckBox;
     private CheckBox autoRunCheckBox;
+    private CheckBox autoMonitorCheckBox;
+    private Spinner<Integer> autoMonitorIntervalSpinner;
+    private Button autoMonitorRunNowButton;
+    private Label autoMonitorInfoLabel;
     private ComboBox<String> browserProfileComboBox;
     private Spinner<Integer> autoRunIntervalSpinner;
     private TextField autoRunStartTimeField;
@@ -190,6 +188,7 @@ public final class DownloaderFxApp extends Application {
     private int failCount;
     private boolean runningState;
     private Task<RunStats> activeDownloadTask;
+    private Task<?> activeMonitorTask;
     private String currentReportLink;
     private volatile boolean stopRequestedByUser;
     private volatile boolean stopRequestedByScheduler;
@@ -201,6 +200,10 @@ public final class DownloaderFxApp extends Application {
     private UpdateInfo latestUpdateInfo;
     private Path downloadedUpdatePath;
     private ScheduledExecutorService autoRunScheduler;
+    private ScheduledExecutorService autoMonitorScheduler;
+    private volatile LocalDateTime nextAutoMonitorAt;
+    private volatile LocalDateTime lastAutoMonitorAt;
+    private volatile Integer lastAutoMonitorRows;
     private final AtomicBoolean folderChooserOpening = new AtomicBoolean(false);
     private final Map<FolderItem, ChangeListener<Boolean>> folderSelectionListeners = new IdentityHashMap<>();
 
@@ -248,7 +251,7 @@ public final class DownloaderFxApp extends Application {
         uncheckAllFoldersButton.getStyleClass().add("secondary-button");
         uncheckAllFoldersButton.setOnAction(event -> handleCheckAllFolders(false));
 
-        autoRunCheckBox = new CheckBox("Enable auto run");
+        autoRunCheckBox = new CheckBox("Enable auto update monitor");
         autoRunIntervalSpinner = new Spinner<>(1, 1440, 30, 1);
         autoRunIntervalSpinner.setEditable(true);
         autoRunIntervalSpinner.setPrefWidth(115);
@@ -285,11 +288,29 @@ public final class DownloaderFxApp extends Application {
         autoRunSaveButton.setMinWidth(126);
         autoRunSaveButton.setOnAction(event -> handleSaveAutoRunConfig());
 
-        autoRunInfoLabel = new Label("Auto run is OFF");
+        autoRunInfoLabel = new Label("Auto update monitor is OFF");
         autoRunInfoLabel.getStyleClass().add("field-hint");
+
+        autoMonitorIntervalSpinner = new Spinner<>(1, 1440, 15, 1);
+        autoMonitorIntervalSpinner.setEditable(true);
+        autoMonitorIntervalSpinner.setPrefWidth(115);
+        autoMonitorIntervalSpinner.setMinWidth(115);
+        autoMonitorIntervalSpinner.setMaxWidth(115);
+
+        autoMonitorCheckBox = new CheckBox("Enable auto update monitor");
+        autoMonitorCheckBox.setOnAction(event ->
+            applyAutoMonitorSchedule(autoMonitorCheckBox.isSelected(), autoMonitorIntervalSpinner.getValue()));
+
+        autoMonitorRunNowButton = new Button("Run monitor now");
+        autoMonitorRunNowButton.getStyleClass().add("outline-primary-button");
+        autoMonitorRunNowButton.setOnAction(event -> runAutoMonitorCycle(true));
+
+        autoMonitorInfoLabel = new Label("Auto monitor is OFF");
+        autoMonitorInfoLabel.getStyleClass().add("field-hint");
 
         loadSavedFolders();
         loadAutoRunConfig();
+        applyAutoMonitorSchedule(false, autoMonitorIntervalSpinner.getValue());
 
         reportField = new TextField();
         reportField.setPromptText("Google Sheets link will appear here...");
@@ -299,7 +320,7 @@ public final class DownloaderFxApp extends Application {
         concurrencySpinner.setEditable(true);
         concurrencySpinner.setPrefWidth(130);
 
-        startButton = new Button("START DOWNLOAD");
+        startButton = new Button("RUN MONITOR");
         startButton.getStyleClass().add("primary-button");
 
         stopButton = new Button("STOP");
@@ -323,10 +344,6 @@ public final class DownloaderFxApp extends Application {
         sheetsConfigButton = new Button("Google Sheets");
         sheetsConfigButton.getStyleClass().add("secondary-button");
         sheetsConfigButton.setOnAction(event -> showGoogleSheetsConfigDialog());
-
-        testDownloadButton = new Button("Test file download");
-        testDownloadButton.getStyleClass().add("secondary-button");
-        testDownloadButton.setOnAction(event -> handleTestFileDownload());
 
         UpdateConfigStore.UpdateConfig updateConfig = UpdateConfigStore.load().normalized();
         updateMetadataUrlField = new TextField(defaultText(updateConfig.metadataUrl()));
@@ -461,7 +478,7 @@ public final class DownloaderFxApp extends Application {
         downloadScroll.setFitToWidth(true);
         downloadScroll.setFitToHeight(true);
         downloadScroll.setStyle("-fx-background-color: transparent;");
-        Tab downloadTab = new Tab("Download", downloadScroll);
+        Tab downloadTab = new Tab("Monitor", downloadScroll);
         downloadTab.setClosable(false);
 
         VBox reportContent = new VBox(reportCard);
@@ -569,7 +586,7 @@ public final class DownloaderFxApp extends Application {
         Label maintenanceTitle = new Label("Maintenance");
         maintenanceTitle.getStyleClass().add("field-label");
 
-        HBox actions = new HBox(10, sheetsConfigButton, clearStateButton, testDownloadButton);
+        HBox actions = new HBox(10, sheetsConfigButton, clearStateButton);
         actions.setAlignment(Pos.CENTER_LEFT);
         actions.getStyleClass().add("settings-actions");
 
@@ -670,7 +687,7 @@ public final class DownloaderFxApp extends Application {
     }
 
     private VBox buildAutoRunBar() {
-        Label intervalLabel = new Label("Every (minutes)");
+        Label intervalLabel = new Label("Rest between sessions (minutes)");
         intervalLabel.getStyleClass().add("field-label");
 
         Label startTimeLabel = new Label("Start (HH:mm)");
@@ -725,7 +742,7 @@ public final class DownloaderFxApp extends Application {
         Region spacer = new Region();
         VBox.setVgrow(spacer, Priority.ALWAYS);
 
-        VBox box = new VBox(8, modeRow, infoRow, gridRow, daysTitleRow, daysRow, spacer, saveRow);
+        VBox box = new VBox(8, modeRow, infoRow, gridRow, daysTitleRow, daysRow, saveRow, spacer);
         box.getStyleClass().add("autorun-box");
         return box;
     }
@@ -736,99 +753,21 @@ public final class DownloaderFxApp extends Application {
     }
 
     private void startDownload(boolean autoTriggered) {
-        if (activeDownloadTask != null) {
+        if (activeMonitorTask != null || activeDownloadTask != null) {
             if (autoTriggered) {
-                autoRestartAfterStop = true;
-                updateStatus("Auto-run queued", "status-running");
-                addDetailLog("Auto run: current cycle is still running. Next cycle will start right after this cycle finishes.");
+                updateStatus("Auto-run skipped", "status-running");
+                addDetailLog("Auto update monitor: cycle is already running.");
+            } else {
+                updateStatus("Monitor is running", "status-running");
             }
             return;
         }
-
         stopRequestedByUser = false;
         stopRequestedByScheduler = false;
         activeRunAutoTriggered = autoTriggered;
         clearRunData();
         refreshProgressView();
-
-        List<Path> rootPaths;
-        try {
-            rootPaths = requireSelectedPaths();
-        } catch (IllegalArgumentException ex) {
-            addDetailLog(ex.getMessage());
-            updateStatus("Error", "status-error");
-            return;
-        }
-
-        int concurrency = normalizeConcurrency(concurrencySpinner.getValue());
-        concurrencySpinner.getValueFactory().setValue(concurrency);
-        ensureChromeProfilesForConcurrency(concurrency);
-
-        updateStatus(autoTriggered ? "Running (auto)..." : "Running...", "status-running");
-        setDownloadRunningState(true);
-
-        Task<RunStats> task = new Task<>() {
-            @Override
-            protected RunStats call() {
-                return DownloadCoordinator.run(
-                    rootPaths,
-                    concurrency,
-                    false
-                );
-            }
-        };
-
-        task.setOnSucceeded(event -> {
-            if (task.isCancelled() || stopRequestedByUser || stopRequestedByScheduler) {
-                applyStoppedStateMessage();
-            } else {
-                RunStats stats = task.getValue();
-                loadedKeywords = stats.getTotalKeywords();
-                successCount = stats.getSuccessCount();
-                failCount = stats.getFailCount();
-                failedKeywords.clear();
-                failedKeywordSet.clear();
-                for (RunStats.FailureRecord failure : stats.getFailures()) {
-                    failedKeywords.add(failure.keyword() + " | " + failure.reason());
-                    if (failure.keyword() != null && !failure.keyword().isBlank()) {
-                        failedKeywordSet.add(failure.keyword());
-                    }
-                }
-                failCount = failedKeywordSet.size();
-                addDetailLog(String.format("=== COMPLETED === Success: %d | Failed: %d | Total: %d",
-                    successCount, failCount, loadedKeywords));
-                updateStatus("Completed", "status-success");
-                updateReportFromConfig();
-            }
-            refreshProgressView();
-            finishDownloadTask();
-        });
-
-        task.setOnFailed(event -> {
-            Throwable err = task.getException();
-            if (task.isCancelled() || stopRequestedByUser || stopRequestedByScheduler) {
-                applyStoppedStateMessage();
-            } else if (isAllKeywordsCompletedError(err)) {
-                handleAllKeywordsCompletedNotice(activeRunAutoTriggered);
-            } else {
-                updateStatus("Run failed", "status-error");
-                addDetailLog("Error: " + (err != null ? err.getMessage() : "Unknown"));
-            }
-            refreshProgressView();
-            finishDownloadTask();
-        });
-
-        task.setOnCancelled(event -> {
-            applyStoppedStateMessage();
-            refreshProgressView();
-            finishDownloadTask();
-        });
-
-        activeDownloadTask = task;
-
-        Thread worker = new Thread(task, "Downloader-Worker");
-        worker.setDaemon(true);
-        worker.start();
+        runAutoMonitorCycle(!autoTriggered);
     }
 
     private boolean isAllKeywordsCompletedError(Throwable err) {
@@ -841,19 +780,19 @@ public final class DownloaderFxApp extends Application {
 
     private void handleAllKeywordsCompletedNotice(boolean autoTriggered) {
         updateStatus("All keywords completed", "status-success");
-        addDetailLog("All selected keywords have already been downloaded in previous runs.");
+        addDetailLog("All selected keywords have already been processed successfully in previous monitor runs.");
         addDetailLog("No pending keyword remains for this run.");
         addDetailLog("If you want to run again, use 'Clear run state' in Settings.");
 
         if (autoTriggered) {
             LocalDateTime now = LocalDateTime.now();
             if (autoNoPendingAlertShowing) {
-                addDetailLog("Auto run: no-pending popup is already showing. Skip duplicate popup.");
+                addDetailLog("Auto update monitor: no-pending popup is already showing. Skip duplicate popup.");
                 return;
             }
             if (lastAutoNoPendingAlertAt != null
                 && Duration.between(lastAutoNoPendingAlertAt, now).toMinutes() < 10) {
-                addDetailLog("Auto run: no-pending popup suppressed (cooldown 10 minutes).");
+                addDetailLog("Auto update monitor: no-pending popup suppressed (cooldown 10 minutes).");
                 return;
             }
 
@@ -875,21 +814,27 @@ public final class DownloaderFxApp extends Application {
         alert.initOwner(ownerStage);
         alert.setTitle("No pending keywords");
         alert.setHeaderText("All selected keywords are already completed.");
-        alert.setContentText("No new data to download.\n\nTo run again from scratch, open Settings and click 'Clear run state'.");
+        alert.setContentText("No pending keyword to process.\n\nTo run again from scratch, open Settings and click 'Clear run state'.");
         alert.showAndWait();
     }
 
     private void handleStopDownload() {
-        if (activeDownloadTask == null) {
+        if (activeDownloadTask == null && activeMonitorTask == null) {
             return;
         }
         stopRequestedByUser = true;
         stopRequestedByScheduler = false;
         autoRestartAfterStop = false;
         stopButton.setDisable(true);
-        updateStatus("Stopping download...", "status-running");
-        addDetailLog("Download stop requested...");
+        updateStatus("Stopping monitor...", "status-running");
+        addDetailLog("Monitor stop requested...");
         DownloadCoordinator.requestStop();
+        if (activeMonitorTask != null) {
+            activeMonitorTask.cancel(true);
+        }
+        if (activeDownloadTask != null) {
+            activeDownloadTask.cancel(true);
+        }
     }
 
     private void applyStoppedStateMessage() {
@@ -934,241 +879,6 @@ public final class DownloaderFxApp extends Application {
         } catch (Exception ex) {
             setUpdateStatus("Save URL failed: " + ex.getMessage(), true);
         }
-    }
-
-    private void handleTestFileDownload() {
-        TextInputDialog dialog = new TextInputDialog("ae74ffdf-f2df-4e84-9390-b38a84b85c7e");
-        dialog.initOwner(ownerStage);
-        dialog.setTitle("Test file download");
-        dialog.setHeaderText("Enter file id, field=..., fileId=..., or a full download URL");
-        dialog.setContentText("File id / URL:");
-
-        Optional<String> input = dialog.showAndWait();
-        if (input.isEmpty()) {
-            return;
-        }
-
-        String fileInput = input.get().trim();
-        if (fileInput.isBlank()) {
-            updateStatus("Test download failed", "status-error");
-            addDetailLog("Test download failed: file id is required.");
-            return;
-        }
-
-        testDownloadButton.setDisable(true);
-        updateStatus("Testing download...", "status-running");
-        addDetailLog("Test download: requesting file " + fileInput);
-
-        Task<Path> task = new Task<>() {
-            @Override
-            protected Path call() throws Exception {
-                return downloadTestFile(fileInput);
-            }
-        };
-
-        task.setOnSucceeded(event -> {
-            Path downloaded = task.getValue();
-            updateStatus("Test download OK", "status-success");
-            addDetailLog("Test download OK: " + downloaded + " (" + humanBytesSafe(downloaded) + ")");
-            testDownloadButton.setDisable(runningState);
-        });
-
-        task.setOnFailed(event -> {
-            Throwable ex = task.getException();
-            String message = ex == null ? "Unknown" : ex.getMessage();
-            updateStatus("Test download failed", "status-error");
-            addDetailLog("Test download failed: " + message);
-            showTestDownloadError(message);
-            testDownloadButton.setDisable(runningState);
-        });
-
-        Thread worker = new Thread(task, "Test-File-Download-Worker");
-        worker.setDaemon(true);
-        worker.start();
-    }
-
-    private Path downloadTestFile(String input) throws Exception {
-        List<String> urls = buildTestDownloadUrls(input);
-        Exception lastError = null;
-        for (String url : urls) {
-            try {
-                return downloadTestFileFromUrl(url, input);
-            } catch (Exception ex) {
-                lastError = ex;
-                addDetailLog("Test download attempt failed: " + url + " | " + ex.getMessage());
-            }
-        }
-        throw lastError == null ? new IOException("No download URL generated.") : lastError;
-    }
-
-    private Path downloadTestFileFromUrl(String url, String input) throws Exception {
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create(url))
-            .timeout(Duration.ofSeconds(60))
-            .header("Accept", "application/json, text/plain, */*")
-            .header("Origin", "https://muasamcong.mpi.gov.vn")
-            .header("Referer", "https://muasamcong.mpi.gov.vn/")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            .GET()
-            .build();
-
-        HttpResponse<byte[]> response = TEST_DOWNLOAD_HTTP_CLIENT.send(
-            request,
-            HttpResponse.BodyHandlers.ofByteArray()
-        );
-
-        if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            String body = new String(response.body(), StandardCharsets.UTF_8);
-            throw new IOException("HTTP " + response.statusCode() + ": " + trimForLog(body));
-        }
-
-        byte[] body = response.body();
-        if (body == null || body.length == 0) {
-            throw new IOException("empty response body");
-        }
-
-        Path folder = Utils.dataDirectory().resolve("test-downloads").toAbsolutePath().normalize();
-        Utils.ensureDirectory(folder);
-
-        String fileName = response.headers()
-            .firstValue("Content-Disposition")
-            .map(this::fileNameFromContentDisposition)
-            .filter(name -> !name.isBlank())
-            .orElse("test-download-" + normalizedFileId(input) + guessExtension(response, body));
-
-        Path target = uniquePath(folder.resolve(sanitizeFileNameKeepExtension(fileName)));
-        Files.write(target, body);
-        return target;
-    }
-
-    private List<String> buildTestDownloadUrls(String input) {
-        String trimmed = input == null ? "" : input.trim();
-        if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-            return List.of(trimmed);
-        }
-
-        String value = trimmed;
-        String explicitParam = null;
-        int equalsIndex = trimmed.indexOf('=');
-        if (equalsIndex > 0 && equalsIndex < trimmed.length() - 1) {
-            explicitParam = trimmed.substring(0, equalsIndex).trim();
-            value = trimmed.substring(equalsIndex + 1).trim();
-        }
-
-        String encodedValue = URLEncoder.encode(value, StandardCharsets.UTF_8);
-        if ("field".equalsIgnoreCase(explicitParam) || "fileId".equalsIgnoreCase(explicitParam)) {
-            return List.of(TEST_DOWNLOAD_ENDPOINT + "?" + explicitParam + "=" + encodedValue);
-        }
-        return List.of(
-            TEST_DOWNLOAD_ENDPOINT + "?field=" + encodedValue,
-            TEST_DOWNLOAD_ENDPOINT + "?fileId=" + encodedValue
-        );
-    }
-
-    private void showTestDownloadError(String message) {
-        Alert alert = new Alert(Alert.AlertType.ERROR);
-        alert.initOwner(ownerStage);
-        alert.setTitle("Test download failed");
-        alert.setHeaderText("Unable to download the test file.");
-        alert.setContentText(message == null || message.isBlank() ? "Unknown error" : message);
-        alert.show();
-    }
-
-    private String normalizedFileId(String input) {
-        if (input == null || input.isBlank()) {
-            return "file";
-        }
-        String value = input.trim();
-        int equalsIndex = value.indexOf('=');
-        if (equalsIndex > 0 && equalsIndex < value.length() - 1) {
-            value = value.substring(equalsIndex + 1).trim();
-        }
-        int queryIndex = value.indexOf('?');
-        if (queryIndex >= 0 && queryIndex < value.length() - 1) {
-            value = value.substring(queryIndex + 1);
-        }
-        return Utils.sanitizeFileName(value);
-    }
-
-    private String sanitizeFileNameKeepExtension(String fileName) {
-        String value = fileName == null || fileName.isBlank() ? "download.bin" : fileName.trim();
-        int dotIndex = value.lastIndexOf('.');
-        if (dotIndex <= 0 || dotIndex == value.length() - 1) {
-            return Utils.sanitizeFileName(value);
-        }
-        String base = Utils.sanitizeFileName(value.substring(0, dotIndex));
-        String extension = value.substring(dotIndex).replaceAll("[^A-Za-z0-9.]", "");
-        if (extension.isBlank() || extension.length() > 10) {
-            extension = ".bin";
-        }
-        return base + extension;
-    }
-
-    private String fileNameFromContentDisposition(String contentDisposition) {
-        if (contentDisposition == null || contentDisposition.isBlank()) {
-            return "";
-        }
-        Matcher matcher = Pattern.compile("filename\\*?=([^;]+)").matcher(contentDisposition);
-        if (!matcher.find()) {
-            return "";
-        }
-
-        String value = matcher.group(1).trim();
-        if (value.regionMatches(true, 0, "UTF-8''", 0, 7)) {
-            value = value.substring(7);
-        }
-        value = value.replaceAll("^\"|\"$", "");
-        return URLDecoder.decode(value, StandardCharsets.UTF_8);
-    }
-
-    private String guessExtension(HttpResponse<byte[]> response, byte[] body) {
-        String contentType = response.headers().firstValue("Content-Type").orElse("").toLowerCase();
-        if (contentType.contains("pdf") || startsWith(body, '%', 'P', 'D', 'F')) {
-            return ".pdf";
-        }
-        if (startsWith(body, 'P', 'K')) {
-            return ".zip";
-        }
-        return ".bin";
-    }
-
-    private boolean startsWith(byte[] body, char... chars) {
-        if (body == null || body.length < chars.length) {
-            return false;
-        }
-        for (int i = 0; i < chars.length; i++) {
-            if ((body[i] & 0xff) != chars[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private Path uniquePath(Path target) {
-        if (!Files.exists(target)) {
-            return target;
-        }
-
-        String fileName = target.getFileName().toString();
-        int dot = fileName.lastIndexOf('.');
-        String base = dot > 0 ? fileName.substring(0, dot) : fileName;
-        String ext = dot > 0 ? fileName.substring(dot) : "";
-        Path parent = target.getParent();
-        int suffix = 1;
-        Path candidate;
-        do {
-            candidate = parent.resolve(base + "_" + suffix + ext);
-            suffix++;
-        } while (Files.exists(candidate));
-        return candidate;
-    }
-
-    private String trimForLog(String value) {
-        if (value == null || value.isBlank()) {
-            return "empty response";
-        }
-        String normalized = value.replaceAll("\\s+", " ").trim();
-        return normalized.length() > 300 ? normalized.substring(0, 300) + "..." : normalized;
     }
 
     private void handleCheckForUpdates() {
@@ -1678,11 +1388,19 @@ public final class DownloaderFxApp extends Application {
 
             int removed = RunStateStore.removeByKeys(keys);
             int removedTrackingRecords = BidTrackingRecordStore.removeByKeys(keys);
+            int removedMonitorRecords = MonitorKeywordStore.removeByKeys(keys);
+            int removedFingerprintRecords = ArtifactFingerprintStore.removeByKeys(keys);
             int removedRows = DownloadWorker.removeBidInfoRowsByStateRecords(selectedRecords);
             updateStatus("State removed: " + removed, "status-success");
             addDetailLog("Removed " + removed + " state records.");
             if (removedTrackingRecords > 0) {
                 addDetailLog("Removed " + removedTrackingRecords + " bid tracking record(s).");
+            }
+            if (removedMonitorRecords > 0) {
+                addDetailLog("Removed " + removedMonitorRecords + " monitor keyword record(s).");
+            }
+            if (removedFingerprintRecords > 0) {
+                addDetailLog("Removed " + removedFingerprintRecords + " artifact fingerprint record(s).");
             }
             if (removedRows > 0) {
                 addDetailLog("Removed " + removedRows + " row(s) from bid_sheet_rows.json.");
@@ -1708,12 +1426,14 @@ public final class DownloaderFxApp extends Application {
                 RunStateStore.clear();
                 RunHistoryStore.clear();
                 BidTrackingRecordStore.clear();
+                MonitorKeywordStore.clear();
+                ArtifactFingerprintStore.clear();
                 DownloadWorker.clearBidInfoOutput();
                 updateReportFromConfig();
                 clearRunData();
                 refreshProgressView();
                 updateStatus("Run state cleared", "status-success");
-                addDetailLog("run_state.json, run_history, bid_tracking_records.json and bid_sheet_rows.json were cleared.");
+                addDetailLog("run_state.json, run_history, bid_tracking_records.json, monitor_tracking_keywords.json, monitor_artifact_fingerprints.json and bid_sheet_rows.json were cleared.");
                 dialog.close();
             } catch (Exception ex) {
                 updateStatus("Clear state failed", "status-error");
@@ -1921,7 +1641,7 @@ public final class DownloaderFxApp extends Application {
         setDownloadRunningState(false);
         viewLogButton.setDisable(false);
         if (shouldRestart) {
-            addDetailLog("Auto run: starting new cycle now.");
+            addDetailLog("Auto update monitor: starting new cycle now.");
             startDownload(true);
         }
     }
@@ -1935,8 +1655,13 @@ public final class DownloaderFxApp extends Application {
 
     /** Update shared UI elements based on whether ANY task is running. */
     private void updateSharedUiState() {
-        boolean anyRunning = activeDownloadTask != null;
+        boolean downloadRunning = activeDownloadTask != null;
+        boolean monitorRunning = activeMonitorTask != null;
+        boolean anyRunning = downloadRunning || monitorRunning;
         runningState = anyRunning;
+        startButton.setDisable(anyRunning || countSelectedFolders() <= 0);
+        stopButton.setDisable(!anyRunning);
+        concurrencySpinner.setDisable(anyRunning);
         folderListView.setDisable(anyRunning);
         addFolderButton.setDisable(anyRunning);
         deleteFolderButton.setDisable(anyRunning);
@@ -1945,13 +1670,13 @@ public final class DownloaderFxApp extends Application {
         exportSheetButton.setDisable(anyRunning);
         clearStateButton.setDisable(anyRunning);
         sheetsConfigButton.setDisable(anyRunning);
-        testDownloadButton.setDisable(anyRunning);
         browserProfileComboBox.setDisable(anyRunning);
         saveBrowserProfileButton.setDisable(anyRunning);
         autoRunCheckBox.setDisable(anyRunning);
         autoRunStartTimeField.setDisable(anyRunning);
         autoRunStopTimeField.setDisable(anyRunning);
         autoRunSaveButton.setDisable(anyRunning);
+        autoMonitorRunNowButton.setDisable(anyRunning);
         progressIndicator.setVisible(anyRunning);
         progressIndicator.setManaged(anyRunning);
         refreshAutoRunModeUi();
@@ -2038,7 +1763,7 @@ public final class DownloaderFxApp extends Application {
             updateAutoRunTimeValidation();
             applyAutoRunSchedule(config.enabled(), config.intervalMinutes(), config.startTime(), config.stopTime(), config.days(), false);
         } catch (Exception ex) {
-            addDetailLog("Failed to load auto-run config: " + ex.getMessage());
+            addDetailLog("Failed to load auto update monitor config: " + ex.getMessage());
         }
     }
 
@@ -2058,7 +1783,7 @@ public final class DownloaderFxApp extends Application {
         }
         if (days == null || days.isBlank()) {
             updateStatus("Schedule save failed", "status-error");
-            addDetailLog("Please select at least one day for auto run.");
+            addDetailLog("Please select at least one day for auto update monitor.");
             updateAutoRunTimeValidation();
             return;
         }
@@ -2067,14 +1792,14 @@ public final class DownloaderFxApp extends Application {
             applyAutoRunSchedule(enabled, intervalMinutes, startTime, stopTime, days, true);
             updateStatus("Schedule saved", "status-success");
             if (!enabled) {
-                addDetailLog("Auto run disabled.");
+                addDetailLog("Auto update monitor disabled.");
             } else {
-                addDetailLog("Auto run enabled. Interval: " + intervalMinutes + " minute(s), window: "
+                addDetailLog("Auto update monitor enabled. Rest between sessions: " + intervalMinutes + " minute(s), window: "
                     + startTime + " - " + stopTime + " | days: " + days + ".");
             }
         } catch (Exception ex) {
             updateStatus("Schedule save failed", "status-error");
-            addDetailLog("Unable to save auto-run config: " + ex.getMessage());
+            addDetailLog("Unable to save auto update monitor config: " + ex.getMessage());
         }
     }
 
@@ -2241,7 +1966,7 @@ public final class DownloaderFxApp extends Application {
         String safeDays = normalizeAutoRunDaysCsv(days);
         int intervalMinutes = normalizeAutoRunInterval(autoRunIntervalSpinner.getValue());
         if (safeStart == null || safeStop == null) {
-            addDetailLog("Auto run: invalid Start/Stop time. Auto run disabled.");
+            addDetailLog("Auto update monitor: invalid Start/Stop time. Auto update monitor disabled.");
             autoRunCheckBox.setSelected(false);
             applyAutoRunSchedule(false, intervalMinutes, autoRunStartTimeField.getText(), autoRunStopTimeField.getText(), safeDays, true);
             return;
@@ -2250,18 +1975,18 @@ public final class DownloaderFxApp extends Application {
         Set<Integer> allowedDays = parseAllowedDays(safeDays);
         if (!allowedDays.contains(LocalDate.now().getDayOfWeek().getValue())
             || !isWithinAutoRunWindow(now, LocalTime.parse(safeStart), LocalTime.parse(safeStop))) {
-            addDetailLog("Auto run: stop time reached. Auto run disabled.");
+            addDetailLog("Auto update monitor: stop time reached. Auto update monitor disabled.");
             autoRunCheckBox.setSelected(false);
             applyAutoRunSchedule(false, intervalMinutes, safeStart, safeStop, safeDays, true);
-            updateStatus("Auto run stopped", "status-success");
+            updateStatus("Auto monitor stopped", "status-success");
             return;
         }
-        addDetailLog("Auto run: cycle triggered (every " + intervalMinutes + " minute(s), window "
+        addDetailLog("Auto update monitor: cycle triggered (rest " + intervalMinutes + " minute(s), window "
             + safeStart + "-" + safeStop + ").");
 
         if (activeDownloadTask != null) {
             autoRestartAfterStop = true;
-            addDetailLog("Auto run: current cycle still running, queued next cycle (graceful mode).");
+            addDetailLog("Auto update monitor: current cycle still running, queued next cycle (graceful mode).");
             return;
         }
 
@@ -2271,7 +1996,7 @@ public final class DownloaderFxApp extends Application {
     private void updateAutoRunInfoLabel() {
         boolean enabled = autoRunCheckBox.isSelected();
         if (!enabled) {
-            autoRunInfoLabel.setText("Auto run is OFF");
+            autoRunInfoLabel.setText("Auto update monitor is OFF");
             return;
         }
 
@@ -2280,7 +2005,7 @@ public final class DownloaderFxApp extends Application {
         String stopTime = normalizeSpecificTime(autoRunStopTimeField.getText());
         String days = normalizeAutoRunDaysCsv(selectedAutoRunDaysCsv());
 
-        String scheduleText = "Every " + intervalMinutes + "m"
+        String scheduleText = "Rest " + intervalMinutes + "m"
             + " • Window: " + (startTime == null ? "--:--" : startTime)
             + "-" + (stopTime == null ? "--:--" : stopTime)
             + " • Days: " + formatAutoRunDaysForLabel(days);
@@ -2426,6 +2151,265 @@ public final class DownloaderFxApp extends Application {
         }
     }
 
+    private void applyAutoMonitorSchedule(boolean enabled, Integer intervalMinutes) {
+        int safeInterval = normalizeAutoRunInterval(intervalMinutes);
+        autoMonitorIntervalSpinner.getValueFactory().setValue(safeInterval);
+        restartAutoMonitorScheduler(enabled, safeInterval);
+        updateAutoMonitorInfoLabel();
+    }
+
+    private void restartAutoMonitorScheduler(boolean enabled, int intervalMinutes) {
+        shutdownAutoMonitorScheduler();
+        nextAutoMonitorAt = null;
+        if (!enabled) {
+            updateAutoMonitorInfoLabel();
+            return;
+        }
+
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread thread = new Thread(r, "Auto-Monitor-Scheduler");
+            thread.setDaemon(true);
+            return thread;
+        });
+        autoMonitorScheduler = scheduler;
+        scheduleNextAutoMonitor(intervalMinutes);
+    }
+
+    private void scheduleNextAutoMonitor(int intervalMinutes) {
+        ScheduledExecutorService scheduler = autoMonitorScheduler;
+        if (scheduler == null) {
+            return;
+        }
+        int safeInterval = normalizeAutoRunInterval(intervalMinutes);
+        nextAutoMonitorAt = LocalDateTime.now().plusMinutes(safeInterval);
+        Platform.runLater(this::updateAutoMonitorInfoLabel);
+        scheduler.schedule(() -> Platform.runLater(() -> {
+            if (autoMonitorScheduler == null || !autoMonitorCheckBox.isSelected()) {
+                return;
+            }
+            runAutoMonitorCycle(false);
+            scheduleNextAutoMonitor(safeInterval);
+        }), safeInterval, TimeUnit.MINUTES);
+    }
+
+    private void runAutoMonitorCycle(boolean manual) {
+        if (activeMonitorTask != null) {
+            updateStatus("Monitor is running", "status-running");
+            addDetailLog((manual ? "Monitor now" : "Auto monitor") + ": cycle already running.");
+            return;
+        }
+        if (activeDownloadTask != null) {
+            updateStatus("Monitor skipped", "status-error");
+            addDetailLog((manual ? "Monitor now" : "Auto monitor") + ": skipped because another run is in progress.");
+            return;
+        }
+
+        updateStatus(manual ? "Monitoring now..." : "Auto monitor running...", "status-running");
+        addDetailLog((manual ? "Monitor now" : "Auto monitor") + ": started.");
+
+        List<Path> selectedRoots = selectedPathsForMonitor();
+        if (selectedRoots.isEmpty()) {
+            updateStatus("Monitor skipped", "status-error");
+            addDetailLog((manual ? "Monitor now" : "Auto monitor") + ": no folder selected.");
+            updateAutoMonitorInfoLabel();
+            return;
+        }
+
+        int concurrency = Math.max(1, normalizeConcurrency(concurrencySpinner.getValue()));
+        MonitorKeywordStore.resetStuckRunningRecords();
+        Task<MonitorCycleResult> monitorTask = new Task<>() {
+            @Override
+            protected MonitorCycleResult call() {
+                List<KeywordTarget> monitorTargets = FolderKeywordReader.readKeywords(selectedRoots);
+                MonitorKeywordStore.SyncResult syncResult = syncMonitorKeywords(monitorTargets);
+                List<KeywordTarget> downloadTargets = selectMonitorDownloadTargets(monitorTargets);
+                String downloadError = null;
+                if (!downloadTargets.isEmpty()) {
+                    try {
+                        MonitorKeywordStore.markDownloadRunning(targetKeys(downloadTargets));
+                        RunStats downloadStats = DownloadCoordinator.runTargets(downloadTargets, concurrency);
+                        MonitorKeywordStore.applyDownloadRunStats(downloadStats);
+                    } catch (Exception ex) {
+                        downloadError = ex.getMessage();
+                        MonitorKeywordStore.markDownloadFailed(targetKeys(downloadTargets), downloadError);
+                    }
+                }
+                int rows = BidSheetApiSyncService.refreshBidSheetRowsFromTracking();
+                return new MonitorCycleResult(rows, syncResult, downloadTargets.size(), downloadError);
+            }
+        };
+        activeMonitorTask = monitorTask;
+        updateSharedUiState();
+
+        monitorTask.setOnSucceeded(event -> {
+            MonitorCycleResult result = monitorTask.getValue();
+            int rows = result == null ? 0 : result.rows();
+            GoogleSheetsSyncService.syncFromJsonIfEnabled(BID_ROWS_JSON_FILE);
+            lastAutoMonitorAt = LocalDateTime.now();
+            lastAutoMonitorRows = rows;
+            if (result != null && result.syncResult() != null) {
+                addDetailLog((manual ? "Monitor now" : "Auto monitor")
+                    + ": tracking keywords synced (added=" + result.syncResult().added()
+                    + ", touched=" + result.syncResult().touched()
+                    + ", total=" + result.syncResult().totalRecords() + ").");
+            }
+            if (result != null && result.downloadTargetCount() > 0) {
+                if (result.downloadError() == null || result.downloadError().isBlank()) {
+                    addDetailLog((manual ? "Monitor now" : "Auto monitor")
+                        + ": download completed for monitor keywords: " + result.downloadTargetCount() + ".");
+                } else {
+                    addDetailLog((manual ? "Monitor now" : "Auto monitor")
+                        + ": download for monitor keywords failed: " + result.downloadError());
+                }
+            }
+            addDetailLog((manual ? "Monitor now" : "Auto monitor") + ": refreshed " + rows + " row(s).");
+            if (rows <= 0) {
+                updateStatus("Monitor completed: 0 rows", "status-running");
+                addDetailLog((manual ? "Monitor now" : "Auto monitor")
+                    + ": no tracked packages found yet.");
+            } else {
+                updateStatus(manual ? "Monitor completed" : "Auto monitor updated", "status-success");
+            }
+            activeMonitorTask = null;
+            updateSharedUiState();
+            updateAutoMonitorInfoLabel();
+        });
+
+        monitorTask.setOnFailed(event -> {
+            Throwable ex = monitorTask.getException();
+            lastAutoMonitorAt = LocalDateTime.now();
+            lastAutoMonitorRows = null;
+            addDetailLog((manual ? "Monitor now" : "Auto monitor") + " failed: "
+                + (ex == null ? "Unknown error" : ex.getMessage()));
+            updateStatus("Monitor failed", "status-error");
+            activeMonitorTask = null;
+            updateSharedUiState();
+            updateAutoMonitorInfoLabel();
+        });
+
+        monitorTask.setOnCancelled(event -> {
+            activeMonitorTask = null;
+            updateSharedUiState();
+            updateAutoMonitorInfoLabel();
+            applyStoppedStateMessage();
+        });
+
+        Thread thread = new Thread(monitorTask, manual ? "Monitor-Now-Task" : "Auto-Monitor-Task");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void updateAutoMonitorInfoLabel() {
+        if (autoMonitorCheckBox == null || autoMonitorInfoLabel == null || autoMonitorIntervalSpinner == null) {
+            return;
+        }
+        String lastRunText = buildAutoMonitorLastRunText();
+        if (!autoMonitorCheckBox.isSelected()) {
+            autoMonitorInfoLabel.setText("Auto monitor is OFF" + lastRunText);
+            return;
+        }
+        int interval = normalizeAutoRunInterval(autoMonitorIntervalSpinner.getValue());
+        String nextRunText = nextAutoMonitorAt == null
+            ? ""
+            : " • Next: " + nextAutoMonitorAt.format(NEXT_RUN_FORMAT);
+        autoMonitorInfoLabel.setText("Every " + interval + "m" + nextRunText + lastRunText);
+    }
+
+    private MonitorKeywordStore.SyncResult syncMonitorKeywords(List<KeywordTarget> targets) {
+        List<String> keys = new ArrayList<>();
+        for (KeywordTarget target : targets) {
+            if (target == null || target.folderPath() == null || target.keyword() == null || target.keyword().isBlank()) {
+                continue;
+            }
+            keys.add(target.folderPath().toAbsolutePath().normalize() + "|" + target.keyword().trim());
+        }
+        return MonitorKeywordStore.syncFromFolderKeywords(keys);
+    }
+
+    private List<KeywordTarget> selectMonitorDownloadTargets(List<KeywordTarget> targets) {
+        if (targets == null || targets.isEmpty()) {
+            return List.of();
+        }
+        Map<String, MonitorKeywordRecord> monitorByKey = new LinkedHashMap<>();
+        for (MonitorKeywordRecord record : MonitorKeywordStore.loadEnabledRecords()) {
+            if (record != null && record.key() != null && !record.key().isBlank()) {
+                monitorByKey.put(record.key(), record);
+            }
+        }
+
+        List<KeywordTarget> result = new ArrayList<>();
+        for (KeywordTarget target : targets) {
+            if (target == null || target.folderPath() == null || target.keyword() == null || target.keyword().isBlank()) {
+                continue;
+            }
+            String key = target.folderPath().toAbsolutePath().normalize() + "|" + target.keyword().trim();
+            MonitorKeywordRecord record = monitorByKey.get(key);
+            if (record == null) {
+                continue;
+            }
+            MonitorDownloadStatus status = record.downloadStatus();
+            if (status == null
+                || status == MonitorDownloadStatus.PENDING
+                || status == MonitorDownloadStatus.FAILED
+                || status == MonitorDownloadStatus.PARTIAL) {
+                result.add(target);
+            }
+        }
+        return result;
+    }
+
+    private List<String> targetKeys(List<KeywordTarget> targets) {
+        List<String> keys = new ArrayList<>();
+        if (targets == null || targets.isEmpty()) {
+            return keys;
+        }
+        for (KeywordTarget target : targets) {
+            if (target == null || target.folderPath() == null || target.keyword() == null || target.keyword().isBlank()) {
+                continue;
+            }
+            keys.add(target.folderPath().toAbsolutePath().normalize() + "|" + target.keyword().trim());
+        }
+        return keys;
+    }
+
+    private List<Path> selectedPathsForMonitor() {
+        List<Path> result = new ArrayList<>();
+        Set<String> dedup = new LinkedHashSet<>();
+        for (FolderItem item : folderItems) {
+            if (!item.selectedProperty().get()) {
+                continue;
+            }
+            Path normalized = Path.of(item.path()).toAbsolutePath().normalize();
+            String key = normalized.toString();
+            if (!dedup.add(key)) {
+                continue;
+            }
+            if (Files.exists(normalized) && Files.isDirectory(normalized)) {
+                result.add(normalized);
+            }
+        }
+        return result;
+    }
+
+    private String buildAutoMonitorLastRunText() {
+        LocalDateTime lastAt = lastAutoMonitorAt;
+        if (lastAt == null) {
+            return "";
+        }
+        Integer rows = lastAutoMonitorRows;
+        String rowsText = rows == null ? "failed" : rows + " row(s)";
+        return " • Last: " + lastAt.format(NEXT_RUN_FORMAT) + " (" + rowsText + ")";
+    }
+
+    private void shutdownAutoMonitorScheduler() {
+        ScheduledExecutorService scheduler = autoMonitorScheduler;
+        autoMonitorScheduler = null;
+        nextAutoMonitorAt = null;
+        if (scheduler != null) {
+            scheduler.shutdownNow();
+        }
+    }
+
     private void shutdownAutoRunScheduler() {
         ScheduledExecutorService scheduler = autoRunScheduler;
         autoRunScheduler = null;
@@ -2440,6 +2424,7 @@ public final class DownloaderFxApp extends Application {
         try {
             Utils.clearLogSink();
             shutdownAutoRunScheduler();
+            shutdownAutoMonitorScheduler();
             if (activeDownloadTask != null) {
                 Thread cleanup = new Thread(() -> {
                     try {
@@ -2674,7 +2659,7 @@ public final class DownloaderFxApp extends Application {
             }
         }
         if (selectedFolders.isEmpty()) {
-            throw new IllegalArgumentException("No folders selected for download.");
+            throw new IllegalArgumentException("No folders selected for monitor run.");
         }
 
         List<Path> result = new ArrayList<>();
@@ -3150,6 +3135,14 @@ public final class DownloaderFxApp extends Application {
         return "-";
     }
 
+    private record MonitorCycleResult(
+        int rows,
+        MonitorKeywordStore.SyncResult syncResult,
+        int downloadTargetCount,
+        String downloadError
+    ) {
+    }
+
     private record KeywordProgressRow(
         int index,
         String keyword,
@@ -3220,10 +3213,6 @@ public final class DownloaderFxApp extends Application {
 
         private String path() {
             return path;
-        }
-
-        private void path(String value) {
-            path = value;
         }
 
         private BooleanProperty selectedProperty() {

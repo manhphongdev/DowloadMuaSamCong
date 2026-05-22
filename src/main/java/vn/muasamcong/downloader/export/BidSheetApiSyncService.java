@@ -5,8 +5,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.BigInteger;
 import java.net.URI;
 import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -29,10 +27,12 @@ import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import vn.muasamcong.downloader.core.DownloadWorker;
 import vn.muasamcong.downloader.model.BidApiParams;
+import vn.muasamcong.downloader.model.DownloadHints;
 import vn.muasamcong.downloader.model.BidSheetRow;
 import vn.muasamcong.downloader.model.BidSheetRowBuilder;
 import vn.muasamcong.downloader.model.BidStatus;
 import vn.muasamcong.downloader.model.BidTrackingRecord;
+import vn.muasamcong.downloader.store.ArtifactFingerprintStore;
 import vn.muasamcong.downloader.store.BidTrackingRecordStore;
 import vn.muasamcong.downloader.util.Utils;
 
@@ -46,6 +46,8 @@ public final class BidSheetApiSyncService {
         "https://muasamcong.mpi.gov.vn/o/egp-portal-contractor-selection-v2/services";
     private static final URI TBMT_URI = URI.create(BASE_API + "/lcnt_tbmt_ttc_ldt?token=fake");
     private static final URI KQLCNT_URI = URI.create(BASE_API + "/expose/contractor-input-result/get?token=fake");
+    private static final URI HSMT_CLARIFICATION_URI = URI.create(BASE_API + "/lcnt_tbmt_yclr?token=fake");
+    private static final URI PETITION_URI = URI.create(BASE_API + "/lcnt_tbmt_kn?token=fake");
 
     private BidSheetApiSyncService() {
     }
@@ -62,6 +64,139 @@ public final class BidSheetApiSyncService {
         }
         DownloadWorker.replaceBidInfoRows(rows);
         return rows.size();
+    }
+
+    public static DownloadHints resolveDownloadHints(BidApiParams params) {
+        if (params == null) {
+            return DownloadHints.unknown();
+        }
+
+        JsonNode kqlcnt = postJson(KQLCNT_URI, "{\"id\":" + quote(params.inputResultId()) + "}");
+        JsonNode kqlcntMain = kqlcnt == null ? null : kqlcnt.path("bideContractorInputResultDTO");
+        String decisionFileId = text(kqlcntMain, "decisionFileId");
+        String decisionFileName = text(kqlcntMain, "decisionFileName");
+        String reportFileId = text(kqlcntMain, "reportFileId");
+        String reportFileName = text(kqlcntMain, "reportFileName");
+        String goodFileId = text(kqlcntMain, "goodFileId");
+        String goodFileName = text(kqlcntMain, "goodFileName");
+
+        boolean hasGoodsData = hasGoodsListData(kqlcntMain);
+        boolean hasWinningContractor = hasWinningContractor(kqlcntMain);
+        boolean hasClarification = hasClarificationContent(postJson(
+            HSMT_CLARIFICATION_URI,
+            "{\"notifyNo\":" + quote(params.notifyNo()) + ",\"processApply\":" + quote(params.processApply()) + "}"
+        ));
+        boolean hasPetition = hasPetitionContent(postJson(
+            PETITION_URI,
+            "{\"notifyNo\":" + quote(params.notifyNo()) + ",\"processApply\":" + quote(params.processApply()) + "}"
+        ));
+        return new DownloadHints(
+            true,
+            hasClarification || hasPetition,
+            hasClarification,
+            hasPetition,
+            !isBlankOrUndefined(params.bidOpenId()),
+            !isBlankOrUndefined(decisionFileId),
+            !isBlankOrUndefined(reportFileId),
+            !isBlankOrUndefined(goodFileId) || hasGoodsData,
+            hasWinningContractor,
+            decisionFileId,
+            decisionFileName,
+            reportFileId,
+            reportFileName,
+            goodFileId,
+            goodFileName
+        );
+    }
+
+    private static boolean hasGoodsListData(JsonNode kqlcntMain) {
+        JsonNode lots = kqlcntMain == null ? null : kqlcntMain.path("lotResultDTO");
+        if (lots == null || !lots.isArray()) {
+            return false;
+        }
+        for (JsonNode lot : lots) {
+            String raw = text(lot, "goodsList");
+            if (raw == null || raw.isBlank() || "[]".equals(raw.trim())) {
+                continue;
+            }
+            try {
+                JsonNode goods = MAPPER.readTree(raw);
+                if (goods != null && goods.isArray() && goods.size() > 0) {
+                    return true;
+                }
+            } catch (Exception ex) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasApiContent(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
+            return false;
+        }
+        if (node.isArray()) {
+            return node.size() > 0;
+        }
+        if (node.isObject()) {
+            JsonNode content = firstExisting(node, "content", "data", "records", "list", "items", "result");
+            if (content != null && content != node) {
+                return hasApiContent(content);
+            }
+            JsonNode total = firstExisting(node, "total", "totalElements", "count", "Count");
+            if (total != null && total.canConvertToInt() && total.asInt() > 0) {
+                return true;
+            }
+            return node.size() > 0 && !node.toString().equals("{}");
+        }
+        String value = node.asText();
+        return value != null
+            && !value.isBlank()
+            && !"[]".equals(value.trim())
+            && !"{}".equals(value.trim())
+            && !"null".equalsIgnoreCase(value.trim());
+    }
+
+    private static boolean hasPetitionContent(JsonNode node) {
+        JsonNode list = node == null ? null : node.get("biduPetitionContractorVersionDTOList");
+        return list != null && list.isArray() && list.size() > 0;
+    }
+
+    private static boolean hasClarificationContent(JsonNode node) {
+        JsonNode list = node == null ? null : node.get("biduClarifyReqInvAndContentViewVersionDTOList");
+        return list != null && list.isArray() && list.size() > 0;
+    }
+
+    private static JsonNode firstExisting(JsonNode node, String... fields) {
+        if (node == null || fields == null) {
+            return null;
+        }
+        for (String field : fields) {
+            JsonNode value = node.get(field);
+            if (value != null && !value.isMissingNode() && !value.isNull()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private static boolean hasWinningContractor(JsonNode kqlcntMain) {
+        JsonNode lots = kqlcntMain == null ? null : kqlcntMain.path("lotResultDTO");
+        if (lots == null || !lots.isArray()) {
+            return false;
+        }
+        for (JsonNode lot : lots) {
+            JsonNode contractors = lot.path("contractorList");
+            if (contractors == null || !contractors.isArray()) {
+                continue;
+            }
+            for (JsonNode contractor : contractors) {
+                if (contractor.path("bidResult").asInt(-1) == 1) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static BidSheetRow buildRow(
@@ -89,7 +224,7 @@ public final class BidSheetApiSyncService {
         BigInteger winningBidPrice = winningBidPrice(kqlcntMain);
         String tmbtNumber = text(kqlcntMain, "notifyNo");
 
-        return BidSheetRowBuilder.create()
+        BidSheetRow row = BidSheetRowBuilder.create()
             .tmbtNumber(tmbtNumber)
             .packageName(text(kqlcntMain, "bidName"))
             .procuringEntity(text(kqlcntMain, "investorName"))
@@ -105,6 +240,20 @@ public final class BidSheetApiSyncService {
             .folderLink(folderPath)
             .tenderLink(record.detailUrl())
             .build();
+        String sheetHash = ArtifactFingerprintService.hashObject(List.of(
+            safe(row.tmbtNumber()),
+            safe(row.packageName()),
+            safe(row.procuringEntity()),
+            safe(String.valueOf(row.estimatedBudget())),
+            safe(String.valueOf(row.postedDate())),
+            safe(String.valueOf(row.winningBidPrice())),
+            safe(row.packageExecutionTime()),
+            safe(String.valueOf(row.bidClosingTime())),
+            safe(row.folderLink()),
+            safe(row.tenderLink())
+        ));
+        ArtifactFingerprintStore.updateHashes(record.key(), sheetHash, null, null, null);
+        return row;
     }
 
     private static void exportContractorReport(BidTrackingRecord record, JsonNode kqlcntMain) {
@@ -162,8 +311,15 @@ public final class BidSheetApiSyncService {
                 safe(row.otherContent())
             ));
         }
+        String csvHash = ArtifactFingerprintService.hashObject(rows);
+        if (ArtifactFingerprintStore.isHashUnchanged(
+            record.key(), ArtifactFingerprintStore.HashType.CONTRACTOR_CSV, csvHash)) {
+            Utils.logPlain("Contractor report CSV unchanged. Skipping: " + reportFile.toAbsolutePath());
+            return;
+        }
         try {
             Files.writeString(reportFile, sb.toString(), StandardCharsets.UTF_8);
+            ArtifactFingerprintStore.updateHashes(record.key(), null, csvHash, null, null);
             Utils.logPlain("Contractor report CSV exported: " + reportFile.toAbsolutePath());
         } catch (Exception ex) {
             Utils.logPlain("Unable to write contractor report CSV for " + notifyNo + ": " + ex.getMessage());
@@ -235,6 +391,16 @@ public final class BidSheetApiSyncService {
         }
         Utils.ensureDirectory(outputDir);
         Path outputFile = outputDir.resolve(safeFileName("Bảng dự thầu hàng hoá - " + notifyNo + ".xlsx"));
+        String goodsHash = ArtifactFingerprintService.hashObject(List.of(
+            safe(notifyNo),
+            safe(text(kqlcntMain, "bidName")),
+            goodsRows
+        ));
+        if (ArtifactFingerprintStore.isHashUnchanged(
+            record.key(), ArtifactFingerprintStore.HashType.GOODS_EXCEL, goodsHash)) {
+            Utils.logPlain("Goods bid Excel unchanged. Skipping: " + outputFile.toAbsolutePath());
+            return;
+        }
 
         try (Workbook workbook = new XSSFWorkbook()) {
             Sheet sheet = workbook.createSheet("Bang du thau hang hoa");
@@ -314,6 +480,7 @@ public final class BidSheetApiSyncService {
                 sheet.setColumnWidth(i, widths[i] * 256);
             }
             Files.write(outputFile, workbookToBytes(workbook));
+            ArtifactFingerprintStore.updateHashes(record.key(), null, null, goodsHash, null);
             Utils.logPlain("Goods bid Excel exported: " + outputFile.toAbsolutePath());
         } catch (Exception ex) {
             Utils.logPlain("Unable to export goods bid Excel for " + notifyNo + ": " + ex.getMessage());
@@ -495,26 +662,14 @@ public final class BidSheetApiSyncService {
         if (uri == null || body == null || body.contains(":null")) {
             return null;
         }
-        try {
-            HttpRequest request = HttpRequest.newBuilder(uri)
-                .timeout(Duration.ofSeconds(30))
-                .header("Accept", "application/json, text/plain, */*")
-                .header("Content-Type", "application/json; charset=utf-8")
-                .header("Origin", "https://muasamcong.mpi.gov.vn")
-                .header("Referer", "https://muasamcong.mpi.gov.vn/")
-                .header("User-Agent", "Mozilla/5.0")
-                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-                .build();
-            HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                Utils.logPlain("Bid sheet API request failed: " + uri + " HTTP " + response.statusCode());
-                return null;
-            }
-            return MAPPER.readTree(response.body());
-        } catch (Exception ex) {
-            Utils.logPlain("Bid sheet API request failed: " + uri + " | " + ex.getMessage());
-            return null;
-        }
+        return ApiJsonHttpClient.postJson(
+            HTTP_CLIENT,
+            MAPPER,
+            uri,
+            body,
+            Duration.ofSeconds(30),
+            "Bid sheet API request " + uri
+        );
     }
 
     private static String winningContractPeriodText(JsonNode kqlcntMain) {

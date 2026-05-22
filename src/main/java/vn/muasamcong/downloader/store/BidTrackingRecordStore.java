@@ -57,6 +57,10 @@ public final class BidTrackingRecordStore {
         REPOSITORY.clear();
     }
 
+    public static BidApiParams apiParamsFromDetailUrl(String detailUrl) {
+        return toApiParams(detailUrl);
+    }
+
     private static BidApiParams toApiParams(String detailUrl) {
         Map<String, String> query = parseQuery(detailUrl);
         return new BidApiParams(

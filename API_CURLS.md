@@ -257,6 +257,79 @@ Nguon du lieu: API KQLCNT `bideContractorInputResultDTO.lotResultDTO[].goodsList
 - `Thanh tien da bao gom thue, phi, le phi`: `amount`.
 - `Thoi gian giao hang / Tien do cung cap`: `cPeriod` / `cperiod` / `deliveryTime`.
 
+## API-first Monitor: Check Truoc Khi Mo Chrome
+
+Truoc khi quyet dinh co can chay Selenium download hay khong, monitor goi API de check xem co file moi khong. Chi mo Chrome khi thuc su can thiet.
+
+### Dieu Kien Co ApiParams
+
+Monitor chi co the check API-first neu keyword da co `apiParams` (duoc luu sau lan Selenium dau tien). Neu chua co `apiParams` → bat buoc chay Selenium de lay URL + params.
+
+### Logic Check KQLCNT
+
+Goi API 9 voi `inputResultId`:
+
+```bash
+curl 'https://muasamcong.mpi.gov.vn/o/egp-portal-contractor-selection-v2/services/expose/contractor-input-result/get?token=fake' \
+  -H 'Content-Type: application/json; charset=utf-8' \
+  -X POST \
+  --data-raw '{"id":"<inputResultId>"}'
+```
+
+Mapping field → quyet dinh download:
+
+| Field trong `bideContractorInputResultDTO` | Gia tri | Hanh dong |
+|--------------------------------------------|---------|-----------|
+| `decisionFileId` | not null | Can download file quyet dinh phe duyet KQLCNT (PDF) |
+| `reportFileId` | not null | Can download file bao cao danh gia E-HSDT |
+| `lotResultDTO[].goodsList` | not null, not empty | Can export Excel bang du thau hang hoa |
+| `lotResultDTO[].contractorList[bidResult=1]` | ton tai | Can export CSV nha thau trung thau |
+
+Neu tat ca 4 dieu kien tren deu null/empty → khong can mo Chrome cho tab KQLCNT.
+
+### Logic Check BBMT
+
+Hien tai API chua co field ro rang cho biet BBMT co file hay khong. Rule tam thoi:
+
+- `bidOpenId` trong `BidApiParams` != null → assume co tab BBMT → van can Selenium de check va download.
+- `bidOpenId` == null → bo qua tab BBMT.
+
+Se cap nhat khi co response mau BBMT API.
+
+### Logic Check TBMT (Tab Thong Bao Moi Thau)
+
+Goi API 2 voi `notifyId`:
+
+```bash
+curl 'https://muasamcong.mpi.gov.vn/o/egp-portal-contractor-selection-v2/services/lcnt_tbmt_ttc_ldt?token=fake' \
+  -H 'Content-Type: application/json; charset=utf-8' \
+  -X POST \
+  --data-raw '{"id":"<notifyId>"}'
+```
+
+Dung de lay `bidCloseDate` (thoi diem dong thau) phuc vu tinh trang thai va remaining time. Khong dung de quyet dinh download file TBMT (file TBMT duoc download qua Selenium khi lan dau tien).
+
+### Ket Qua Check → DownloadHints
+
+```
+DownloadHints {
+  needSeleniumFirstRun: boolean   // chua co apiParams → bat buoc Selenium
+  needKqlcntDecision:  boolean    // decisionFileId != null
+  needKqlcntReport:    boolean    // reportFileId != null
+  needGoodsExcel:      boolean    // goodsList co data
+  needContractorCsv:   boolean    // co contractor bidResult=1
+  needBbmt:            boolean    // bidOpenId != null (tam thoi)
+}
+```
+
+Neu `needSeleniumFirstRun = false` va tat ca `need*` deu false → skip Selenium hoan toan, chi goi `refreshBidSheetRowsFromTracking()` de cap nhat sheet tu API data.
+
+### Luu Y Quan Trong
+
+- `decisionFileId` va `reportFileId` la ID file tren he thong, khong phai URL download truc tiep. Selenium van can thiet de click download button tren trang web.
+- API check chi de biet "co file hay khong", khong the download file truc tiep qua API.
+- Neu API tra loi loi (timeout, 5xx) → fallback ve Selenium de dam bao khong bo sot.
+
 ## Rule Phan Loai Status (Search-first)
 
 Nguyen tac:
