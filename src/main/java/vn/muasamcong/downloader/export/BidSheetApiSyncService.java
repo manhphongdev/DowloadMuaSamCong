@@ -2,6 +2,7 @@ package vn.muasamcong.downloader.export;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -11,9 +12,11 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.apache.poi.ss.usermodel.BorderStyle;
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellStyle;
@@ -25,7 +28,9 @@ import org.apache.poi.ss.usermodel.VerticalAlignment;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import vn.muasamcong.downloader.application.sheet.SheetRefreshResult;
 import vn.muasamcong.downloader.core.DownloadWorker;
+import vn.muasamcong.downloader.model.ArtifactFingerprints;
 import vn.muasamcong.downloader.model.BidApiParams;
 import vn.muasamcong.downloader.model.DownloadHints;
 import vn.muasamcong.downloader.model.BidSheetRow;
@@ -46,32 +51,161 @@ public final class BidSheetApiSyncService {
         "https://muasamcong.mpi.gov.vn/o/egp-portal-contractor-selection-v2/services";
     private static final URI TBMT_URI = URI.create(BASE_API + "/lcnt_tbmt_ttc_ldt?token=fake");
     private static final URI KQLCNT_URI = URI.create(BASE_API + "/expose/contractor-input-result/get?token=fake");
+    private static final URI CONTRACT_INFO_URI = URI.create(
+        BASE_API + "/econsign/contract-info/list-contract-for-po?token=fake"
+    );
     private static final URI HSMT_CLARIFICATION_URI = URI.create(BASE_API + "/lcnt_tbmt_yclr?token=fake");
     private static final URI PETITION_URI = URI.create(BASE_API + "/lcnt_tbmt_kn?token=fake");
 
     private BidSheetApiSyncService() {
     }
 
-    public static int refreshBidSheetRowsFromTracking() {
+    public record ApiBundle(JsonNode searchResult, JsonNode tbmt, JsonNode kqlcnt, JsonNode contractInfo) {
+    }
+
+    public record PackageApiSyncResult(
+        BidSheetRow row,
+        DownloadHints hints,
+        String sheetRowHash,
+        String contractorCsvHash,
+        String goodsExcelHash
+    ) {
+    }
+
+    public static ApiBundle fetchApiBundle(BidApiParams params, String keyword) {
+        if (params == null) {
+            return new ApiBundle(null, null, null, null);
+        }
+        if (Thread.currentThread().isInterrupted()) {
+            return new ApiBundle(null, null, null, null);
+        }
+        String notifyNo = firstNonBlank(params.notifyNo(), keyword);
+        JsonNode searchResult = BidSearchApiResolver.resolveMatch(notifyNo);
+        JsonNode tbmt = postJson(TBMT_URI, "{\"id\":" + quote(params.notifyId()) + "}");
+        if (Thread.currentThread().isInterrupted()) {
+            return new ApiBundle(searchResult, tbmt, null, null);
+        }
+        JsonNode kqlcnt = isBlankOrUndefined(params.inputResultId())
+            ? null
+            : postJson(KQLCNT_URI, "{\"id\":" + quote(params.inputResultId()) + "}");
+        if (Thread.currentThread().isInterrupted()) {
+            return new ApiBundle(searchResult, tbmt, kqlcnt, null);
+        }
+        JsonNode contractInfo = isBlankOrUndefined(notifyNo)
+            ? null
+            : postJson(CONTRACT_INFO_URI, "{\"notifyNo\":" + quote(notifyNo) + "}");
+        return new ApiBundle(searchResult, tbmt, kqlcnt, contractInfo);
+    }
+
+    public static PackageApiSyncResult syncPackage(BidTrackingRecord record) {
+        if (record == null || record.apiParams() == null) {
+            return null;
+        }
+        if (Thread.currentThread().isInterrupted()) {
+            return null;
+        }
+        ApiBundle bundle = fetchApiBundle(record.apiParams(), record.keyword());
+        BidSheetRow row = buildRowWithBundle(record, loadExistingStatuses(), bundle);
+        DownloadHints hints = resolveDownloadHints(record.apiParams(), bundle);
+        String sheetHash = row == null ? null : sheetRowHash(row);
+        ArtifactFingerprints fingerprints = ArtifactFingerprintStore.find(record.key());
+        return new PackageApiSyncResult(
+            row,
+            hints,
+            sheetHash,
+            fingerprints == null ? null : fingerprints.contractorCsvHash(),
+            fingerprints == null ? null : fingerprints.goodsExcelHash()
+        );
+    }
+
+    public static SheetRefreshResult refreshBidSheetRowsFromTracking() {
         List<BidTrackingRecord> records = BidTrackingRecordStore.loadRecords();
         Map<String, BidStatus> existingStatuses = loadExistingStatuses();
+        Set<String> existingRowKeys = loadExistingRowKeys();
+        Set<String> newRowKeys = new LinkedHashSet<>();
         List<BidSheetRow> rows = new ArrayList<>();
+        List<String> sheetDataChangedKeys = new ArrayList<>();
         for (BidTrackingRecord record : records) {
+            if (Thread.currentThread().isInterrupted()) {
+                Utils.logPlain("Bid sheet refresh interrupted. Stopping remaining API requests.");
+                return new SheetRefreshResult(loadExistingRowKeys().size(), List.of(), false, true);
+            }
+            if (record == null || record.key() == null || record.key().isBlank()) {
+                continue;
+            }
+            String beforeHash = sheetRowHashBeforeRefresh(record.key());
             BidSheetRow row = buildRow(record, existingStatuses);
             if (row != null) {
                 rows.add(row);
+                newRowKeys.add(rowKey(row.tmbtNumber(), row.parentFolderName(), row.contractPerformanceFolder()));
+                if (sheetRowHashChanged(record.key(), beforeHash)) {
+                    sheetDataChangedKeys.add(record.key());
+                }
             }
         }
-        DownloadWorker.replaceBidInfoRows(rows);
-        return rows.size();
+        boolean rowSetChanged = !existingRowKeys.equals(newRowKeys);
+        boolean sheetChanged = rowSetChanged || !sheetDataChangedKeys.isEmpty();
+        if (sheetChanged) {
+            DownloadWorker.replaceBidInfoRows(rows);
+        } else {
+            Utils.logPlain("Bid sheet rows unchanged. Skipping bid_sheet_rows.json write.");
+        }
+        return new SheetRefreshResult(rows.size(), List.copyOf(sheetDataChangedKeys), sheetChanged, false);
+    }
+
+    private static Set<String> loadExistingRowKeys() {
+        LinkedHashSet<String> keys = new LinkedHashSet<>();
+        Path jsonFile = Utils.dataFile("bid_sheet_rows.json");
+        if (!Files.exists(jsonFile)) {
+            return keys;
+        }
+        try {
+            JsonNode root = MAPPER.readTree(Files.newBufferedReader(jsonFile));
+            JsonNode rows = root == null ? null : (root.isArray() ? root : root.path("rows"));
+            if (rows == null || !rows.isArray()) {
+                return keys;
+            }
+            for (JsonNode row : rows) {
+                keys.add(rowKey(
+                    text(row, "tmbtNumber"),
+                    text(row, "parentFolderName"),
+                    text(row, "contractPerformanceFolder")
+                ));
+            }
+        } catch (Exception ex) {
+            Utils.logPlain("Unable to load existing bid sheet row keys: " + ex.getMessage());
+        }
+        return keys;
+    }
+
+    private static String sheetRowHashBeforeRefresh(String key) {
+        ArtifactFingerprints existing = ArtifactFingerprintStore.find(key);
+        return existing == null ? null : existing.sheetRowHash();
+    }
+
+    private static boolean sheetRowHashChanged(String key, String beforeHash) {
+        ArtifactFingerprints after = ArtifactFingerprintStore.find(key);
+        String afterHash = after == null ? null : after.sheetRowHash();
+        if (afterHash == null) {
+            return false;
+        }
+        return beforeHash == null || !beforeHash.equals(afterHash);
     }
 
     public static DownloadHints resolveDownloadHints(BidApiParams params) {
         if (params == null) {
             return DownloadHints.unknown();
         }
+        return resolveDownloadHints(params, fetchApiBundle(params, params.notifyNo()));
+    }
 
-        JsonNode kqlcnt = postJson(KQLCNT_URI, "{\"id\":" + quote(params.inputResultId()) + "}");
+    public static DownloadHints resolveDownloadHints(BidApiParams params, ApiBundle bundle) {
+        if (params == null) {
+            return DownloadHints.unknown();
+        }
+        ApiBundle resolved = bundle == null ? fetchApiBundle(params, params.notifyNo()) : bundle;
+        JsonNode searchResult = resolved.searchResult();
+        JsonNode kqlcnt = resolved.kqlcnt();
         JsonNode kqlcntMain = kqlcnt == null ? null : kqlcnt.path("bideContractorInputResultDTO");
         String decisionFileId = text(kqlcntMain, "decisionFileId");
         String decisionFileName = text(kqlcntMain, "decisionFileName");
@@ -82,14 +216,26 @@ public final class BidSheetApiSyncService {
 
         boolean hasGoodsData = hasGoodsListData(kqlcntMain);
         boolean hasWinningContractor = hasWinningContractor(kqlcntMain);
-        boolean hasClarification = hasClarificationContent(postJson(
-            HSMT_CLARIFICATION_URI,
-            "{\"notifyNo\":" + quote(params.notifyNo()) + ",\"processApply\":" + quote(params.processApply()) + "}"
-        ));
-        boolean hasPetition = hasPetitionContent(postJson(
-            PETITION_URI,
-            "{\"notifyNo\":" + quote(params.notifyNo()) + ",\"processApply\":" + quote(params.processApply()) + "}"
-        ));
+        Boolean searchHasClarification = positiveCount(searchResult, "numClarifyReq");
+        Boolean searchHasPetition = anyPositiveCount(
+            searchResult,
+            "numPetition",
+            "numPetitionHsmt",
+            "numPetitionLcnt",
+            "numPetitionKqlcnt"
+        );
+        boolean hasClarification = searchHasClarification != null
+            ? searchHasClarification
+            : hasClarificationContent(postJson(
+                HSMT_CLARIFICATION_URI,
+                "{\"notifyNo\":" + quote(params.notifyNo()) + ",\"processApply\":" + quote(params.processApply()) + "}"
+            ));
+        boolean hasPetition = searchHasPetition != null
+            ? searchHasPetition
+            : hasPetitionContent(postJson(
+                PETITION_URI,
+                "{\"notifyNo\":" + quote(params.notifyNo()) + ",\"processApply\":" + quote(params.processApply()) + "}"
+            ));
         return new DownloadHints(
             true,
             hasClarification || hasPetition,
@@ -180,6 +326,46 @@ public final class BidSheetApiSyncService {
         return null;
     }
 
+    private static Boolean anyPositiveCount(JsonNode node, String... fields) {
+        if (fields == null || fields.length == 0) {
+            return null;
+        }
+        boolean found = false;
+        for (String field : fields) {
+            Boolean value = positiveCount(node, field);
+            if (value == null) {
+                continue;
+            }
+            found = true;
+            if (value) {
+                return true;
+            }
+        }
+        return found ? false : null;
+    }
+
+    private static Boolean positiveCount(JsonNode node, String field) {
+        JsonNode value = node == null ? null : node.get(field);
+        if (value != null && value.isArray()) {
+            value = value.size() == 0 ? null : value.get(0);
+        }
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        try {
+            if (value.isNumber()) {
+                return value.asInt() > 0;
+            }
+            String text = value.asText();
+            if (text == null || text.isBlank()) {
+                return null;
+            }
+            return Integer.parseInt(text.trim()) > 0;
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
     private static boolean hasWinningContractor(JsonNode kqlcntMain) {
         JsonNode lots = kqlcntMain == null ? null : kqlcntMain.path("lotResultDTO");
         if (lots == null || !lots.isArray()) {
@@ -206,14 +392,36 @@ public final class BidSheetApiSyncService {
         if (record == null || record.apiParams() == null) {
             return null;
         }
+        return buildRowWithBundle(record, existingStatuses, fetchApiBundle(record.apiParams(), record.keyword()));
+    }
 
+    private static BidSheetRow buildRowWithBundle(
+        BidTrackingRecord record,
+        Map<String, BidStatus> existingStatuses,
+        ApiBundle bundle
+    ) {
+        if (record == null || record.apiParams() == null) {
+            return null;
+        }
+        if (Thread.currentThread().isInterrupted()) {
+            return null;
+        }
         BidApiParams params = record.apiParams();
-        JsonNode tbmt = postJson(TBMT_URI, "{\"id\":" + quote(params.notifyId()) + "}");
-        JsonNode kqlcnt = postJson(KQLCNT_URI, "{\"id\":" + quote(params.inputResultId()) + "}");
+        ApiBundle resolved = bundle == null ? fetchApiBundle(params, record.keyword()) : bundle;
+        JsonNode searchResult = resolved.searchResult();
+        JsonNode tbmt = resolved.tbmt();
+        JsonNode kqlcnt = resolved.kqlcnt();
 
         JsonNode tbmtMain = tbmt == null ? null : tbmt.path("bidoNotifyContractorM");
         JsonNode kqlcntMain = kqlcnt == null ? null : kqlcnt.path("bideContractorInputResultDTO");
-        LocalDateTime bidClosingTime = parseDateTime(text(tbmtMain, "bidCloseDate"));
+        LocalDateTime bidClosingTime = firstNonNull(
+            parseDateTime(text(searchResult, "bidCloseDate")),
+            parseDateTime(text(tbmtMain, "bidCloseDate"))
+        );
+        LocalDateTime bidOpenTime = firstNonNull(
+            parseDateTime(text(searchResult, "bidOpenDate")),
+            parseDateTime(text(tbmtMain, "bidOpenDate"))
+        );
         exportContractorReport(record, kqlcntMain);
         exportGoodsBidExcel(record, kqlcntMain);
 
@@ -222,25 +430,68 @@ public final class BidSheetApiSyncService {
         String parentFolderName = parentFolderName(folderPath);
         String packageExecutionTime = winningContractPeriodText(kqlcntMain);
         BigInteger winningBidPrice = winningBidPrice(kqlcntMain);
-        String tmbtNumber = text(kqlcntMain, "notifyNo");
+        String tmbtNumber = firstNonBlank(
+            text(searchResult, "notifyNo"),
+            text(tbmtMain, "notifyNo"),
+            text(kqlcntMain, "notifyNo"),
+            params.notifyNo()
+        );
+        String packageName = firstNonBlank(
+            text(searchResult, "bidName"),
+            text(tbmtMain, "bidName"),
+            text(kqlcntMain, "bidName")
+        );
+        String procuringEntity = firstNonBlank(
+            text(searchResult, "investorName"),
+            text(tbmtMain, "investorName"),
+            text(kqlcntMain, "investorName"),
+            text(tbmtMain, "procuringEntityName")
+        );
+        BigInteger estimatedBudget = firstNonNull(
+            bigInteger(searchResult, "bidPrice"),
+            bigInteger(tbmtMain, "bidEstimatePrice"),
+            bigInteger(kqlcntMain, "bidEstimatePrice")
+        );
+        LocalDateTime postedDate = firstNonNull(
+            parseDateTime(text(searchResult, "publicDate")),
+            parseDateTime(text(tbmtMain, "publicDate")),
+            parseDateTime(text(kqlcntMain, "publicDate"))
+        );
 
         BidSheetRow row = BidSheetRowBuilder.create()
             .tmbtNumber(tmbtNumber)
-            .packageName(text(kqlcntMain, "bidName"))
-            .procuringEntity(text(kqlcntMain, "investorName"))
+            .packageName(packageName)
+            .procuringEntity(procuringEntity)
             .contractPerformanceFolder(contractFolderName)
             .parentFolderName(parentFolderName)
-            .estimatedBudget(bigInteger(kqlcntMain, "bidEstimatePrice"))
-            .postedDate(parseDateTime(text(kqlcntMain, "publicDate")))
+            .estimatedBudget(estimatedBudget)
+            .postedDate(postedDate)
             .packageExecutionTime(packageExecutionTime)
             .winningBidPrice(winningBidPrice)
-            .status(existingStatuses.get(rowKey(tmbtNumber, parentFolderName, contractFolderName)))
+            .status(resolveStatus(
+                resolved.contractInfo(),
+                searchResult,
+                tbmt,
+                kqlcntMain,
+                bidClosingTime,
+                bidOpenTime,
+                existingStatuses.get(rowKey(tmbtNumber, parentFolderName, contractFolderName))
+            ))
             .bidClosingTime(bidClosingTime)
             .remainingTimeToClosing(remainingToClosing(bidClosingTime))
             .folderLink(folderPath)
             .tenderLink(record.detailUrl())
             .build();
-        String sheetHash = ArtifactFingerprintService.hashObject(List.of(
+        String sheetHash = sheetRowHash(row);
+        ArtifactFingerprintStore.updateHashes(record.key(), sheetHash, null, null, null);
+        return row;
+    }
+
+    private static String sheetRowHash(BidSheetRow row) {
+        if (row == null) {
+            return null;
+        }
+        return ArtifactFingerprintService.hashObject(List.of(
             safe(row.tmbtNumber()),
             safe(row.packageName()),
             safe(row.procuringEntity()),
@@ -248,12 +499,11 @@ public final class BidSheetApiSyncService {
             safe(String.valueOf(row.postedDate())),
             safe(String.valueOf(row.winningBidPrice())),
             safe(row.packageExecutionTime()),
+            row.status() == null ? "" : row.status().name(),
             safe(String.valueOf(row.bidClosingTime())),
             safe(row.folderLink()),
             safe(row.tenderLink())
         ));
-        ArtifactFingerprintStore.updateHashes(record.key(), sheetHash, null, null, null);
-        return row;
     }
 
     private static void exportContractorReport(BidTrackingRecord record, JsonNode kqlcntMain) {
@@ -264,10 +514,6 @@ public final class BidSheetApiSyncService {
         if (notifyNo == null || notifyNo.isBlank()) {
             return;
         }
-        List<ContractorReportRow> rows = contractorReportRows(kqlcntMain);
-        if (rows.isEmpty()) {
-            return;
-        }
 
         Path outputDir = autoDownloadFolder(record.folderPath());
         if (outputDir == null) {
@@ -275,6 +521,14 @@ public final class BidSheetApiSyncService {
         }
         Utils.ensureDirectory(outputDir);
         Path reportFile = outputDir.resolve(safeFileName("Nhà thầu trúng thầu - " + notifyNo + ".csv"));
+        if (artifactFileExists(reportFile)) {
+            return;
+        }
+
+        List<ContractorReportRow> rows = contractorReportRows(kqlcntMain);
+        if (rows.isEmpty()) {
+            return;
+        }
 
         StringBuilder sb = new StringBuilder();
         sb.append('\ufeff');
@@ -312,11 +566,6 @@ public final class BidSheetApiSyncService {
             ));
         }
         String csvHash = ArtifactFingerprintService.hashObject(rows);
-        if (ArtifactFingerprintStore.isHashUnchanged(
-            record.key(), ArtifactFingerprintStore.HashType.CONTRACTOR_CSV, csvHash)) {
-            Utils.logPlain("Contractor report CSV unchanged. Skipping: " + reportFile.toAbsolutePath());
-            return;
-        }
         try {
             Files.writeString(reportFile, sb.toString(), StandardCharsets.UTF_8);
             ArtifactFingerprintStore.updateHashes(record.key(), null, csvHash, null, null);
@@ -380,10 +629,6 @@ public final class BidSheetApiSyncService {
         if (notifyNo == null || notifyNo.isBlank()) {
             return;
         }
-        List<GoodsBidRow> goodsRows = goodsBidRows(kqlcntMain);
-        if (goodsRows.isEmpty()) {
-            return;
-        }
 
         Path outputDir = autoDownloadFolder(record.folderPath());
         if (outputDir == null) {
@@ -391,17 +636,20 @@ public final class BidSheetApiSyncService {
         }
         Utils.ensureDirectory(outputDir);
         Path outputFile = outputDir.resolve(safeFileName("Bảng dự thầu hàng hoá - " + notifyNo + ".xlsx"));
+        if (artifactFileExists(outputFile)) {
+            return;
+        }
+
+        List<GoodsBidRow> goodsRows = goodsBidRows(kqlcntMain);
+        if (goodsRows.isEmpty()) {
+            return;
+        }
+
         String goodsHash = ArtifactFingerprintService.hashObject(List.of(
             safe(notifyNo),
             safe(text(kqlcntMain, "bidName")),
             goodsRows
         ));
-        if (ArtifactFingerprintStore.isHashUnchanged(
-            record.key(), ArtifactFingerprintStore.HashType.GOODS_EXCEL, goodsHash)) {
-            Utils.logPlain("Goods bid Excel unchanged. Skipping: " + outputFile.toAbsolutePath());
-            return;
-        }
-
         try (Workbook workbook = new XSSFWorkbook()) {
             Sheet sheet = workbook.createSheet("Bang du thau hang hoa");
             CellStyle titleStyle = titleStyle(workbook);
@@ -611,7 +859,7 @@ public final class BidSheetApiSyncService {
         cell.setCellStyle(style);
     }
 
-    private static Map<String, BidStatus> loadExistingStatuses() {
+    public static Map<String, BidStatus> loadExistingStatuses() {
         LinkedHashMap<String, BidStatus> statuses = new LinkedHashMap<>();
         Path jsonFile = Utils.dataFile("bid_sheet_rows.json");
         if (!Files.exists(jsonFile)) {
@@ -648,6 +896,82 @@ public final class BidSheetApiSyncService {
         } catch (Exception ex) {
             return null;
         }
+    }
+
+    private static BidStatus resolveStatus(
+        JsonNode contractInfo,
+        JsonNode searchResult,
+        JsonNode tbmt,
+        JsonNode kqlcntMain,
+        LocalDateTime bidClosingTime,
+        LocalDateTime bidOpenTime,
+        BidStatus existingStatus
+    ) {
+        if (hasContractInformation(contractInfo)) {
+            return BidStatus.CONTRACT_INFORMATION_AVAILABLE;
+        }
+        if (isTbmtCancelled(searchResult, tbmt)) {
+            return BidStatus.TBMT_CANCELLED;
+        }
+        if (hasSelectionResult(kqlcntMain, contractInfo)) {
+            return BidStatus.CONTRACTOR_SELECTION_RESULT_AVAILABLE;
+        }
+        LocalDateTime now = LocalDateTime.now();
+        if (bidOpenTime != null && !bidOpenTime.isAfter(now)) {
+            return BidStatus.BID_OPENED;
+        }
+        if (bidClosingTime != null) {
+            return bidClosingTime.isAfter(now)
+                ? BidStatus.INVITATION_OPEN
+                : BidStatus.BIDDING_CLOSED;
+        }
+        return existingStatus;
+    }
+
+    private static boolean hasSelectionResult(JsonNode kqlcntMain, JsonNode contractInfo) {
+        if (hasContractInformation(contractInfo)) {
+            return false;
+        }
+        return kqlcntMain != null && !kqlcntMain.isMissingNode() && !kqlcntMain.isNull() && kqlcntMain.size() > 0;
+    }
+
+    private static boolean hasContractInformation(JsonNode contractInfo) {
+        if (contractInfo == null || contractInfo.isMissingNode() || contractInfo.isNull()) {
+            return false;
+        }
+        JsonNode count = firstExisting(contractInfo, "Count", "count", "total", "totalElements");
+        if (count != null && count.canConvertToInt()) {
+            return count.asInt() > 0;
+        }
+        return hasApiContent(contractInfo);
+    }
+
+    private static boolean isTbmtCancelled(JsonNode searchResult, JsonNode tbmt) {
+        if (isCancelledNotifyStatus(text(searchResult, "status"))) {
+            return true;
+        }
+        JsonNode tbmtMain = tbmt == null ? null : tbmt.path("bidoNotifyContractorM");
+        if (isCancelledNotifyStatus(text(tbmtMain, "status"))) {
+            return true;
+        }
+        JsonNode cancel = tbmt == null ? null : tbmt.path("bidCancelingResponse");
+        if (cancel == null || cancel.isMissingNode() || cancel.isNull() || cancel.size() == 0) {
+            return false;
+        }
+        if (isCancelledNotifyStatus(text(cancel, "status"))) {
+            return true;
+        }
+        return text(cancel, "cancelDate") != null || text(cancel, "cancelReason") != null;
+    }
+
+    private static boolean isCancelledNotifyStatus(String status) {
+        if (status == null || status.isBlank()) {
+            return false;
+        }
+        String normalized = status.trim().toUpperCase();
+        return "CANCELED".equals(normalized)
+            || "CANCELLED".equals(normalized)
+            || "03".equals(normalized);
     }
 
     private static String rowKey(String tmbtNumber, String parentFolderName, String contractFolderName) {
@@ -793,11 +1117,14 @@ public final class BidSheetApiSyncService {
 
     private static BigInteger bigInteger(JsonNode node, String field) {
         JsonNode value = node == null ? null : node.get(field);
+        if (value != null && value.isArray()) {
+            value = value.size() == 0 ? null : value.get(0);
+        }
         if (value == null || value.isNull()) {
             return null;
         }
         try {
-            return new BigInteger(value.asText());
+            return new BigDecimal(value.asText()).toBigInteger();
         } catch (Exception ex) {
             return null;
         }
@@ -805,6 +1132,9 @@ public final class BidSheetApiSyncService {
 
     private static String text(JsonNode node, String field) {
         JsonNode value = node == null ? null : node.get(field);
+        if (value != null && value.isArray()) {
+            value = value.size() == 0 ? null : value.get(0);
+        }
         if (value == null || value.isNull()) {
             return null;
         }
@@ -820,6 +1150,31 @@ public final class BidSheetApiSyncService {
             String value = text(node, field);
             if (value != null) {
                 return value;
+            }
+        }
+        return null;
+    }
+
+    @SafeVarargs
+    private static <T> T firstNonNull(T... values) {
+        if (values == null) {
+            return null;
+        }
+        for (T value : values) {
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) {
+            return null;
+        }
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value.trim();
             }
         }
         return null;
@@ -848,6 +1203,10 @@ public final class BidSheetApiSyncService {
     private static Path autoDownloadFolder(String folderPath) {
         Path path = path(folderPath);
         return path == null ? null : path.resolve("auto-download");
+    }
+
+    private static boolean artifactFileExists(Path file) {
+        return file != null && Files.isRegularFile(file);
     }
 
     private static String safeFileName(String value) {

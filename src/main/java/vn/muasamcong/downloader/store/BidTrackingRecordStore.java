@@ -45,6 +45,37 @@ public final class BidTrackingRecordStore {
         REPOSITORY.upsert(record);
     }
 
+    public static void upsertFromResolved(
+        String folderPath,
+        String keyword,
+        String detailUrl,
+        BidApiParams apiParams,
+        String createdAt
+    ) {
+        if (isBlank(keyword) || apiParams == null) {
+            return;
+        }
+        String normalizedFolder = folderPath == null || folderPath.isBlank()
+            ? ""
+            : java.nio.file.Path.of(folderPath).toAbsolutePath().normalize().toString();
+        String key = normalizedFolder + "|" + keyword.trim();
+        String now = LocalDateTime.now().format(TS);
+        Optional<BidTrackingRecord> existing = REPOSITORY.findByKey(key);
+        String firstSeenAt = existing.map(BidTrackingRecord::firstSeenAt)
+            .filter(s -> !isBlank(s))
+            .orElse(createdAt == null || createdAt.isBlank() ? now : createdAt);
+        BidTrackingRecord record = new BidTrackingRecord(
+            key,
+            normalizedFolder.isBlank() ? folderPath : normalizedFolder,
+            keyword.trim(),
+            detailUrl,
+            firstSeenAt,
+            now,
+            apiParams
+        );
+        REPOSITORY.upsert(record);
+    }
+
     public static List<BidTrackingRecord> loadRecords() {
         return REPOSITORY.findAll();
     }

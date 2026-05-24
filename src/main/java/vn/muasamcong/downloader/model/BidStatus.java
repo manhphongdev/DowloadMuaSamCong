@@ -1,6 +1,7 @@
 package vn.muasamcong.downloader.model;
 
 public enum BidStatus {
+    TBMT_CANCELLED,
     INVITATION_OPEN,
     BIDDING_CLOSED,
     BID_OPENED,

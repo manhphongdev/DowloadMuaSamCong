@@ -31,8 +31,7 @@ public final class BidSearchApiResolver {
         if (keyword == null || keyword.isBlank()) {
             return Optional.empty();
         }
-        JsonNode root = postSearch(keyword.trim());
-        JsonNode match = firstMatchingResult(root, keyword.trim());
+        JsonNode match = resolveMatch(keyword.trim());
         if (match == null) {
             return Optional.empty();
         }
@@ -57,6 +56,14 @@ public final class BidSearchApiResolver {
             return Optional.empty();
         }
         return Optional.of(new ResolvedBidDetail(buildDetailUrl(params), params));
+    }
+
+    public static JsonNode resolveMatch(String keyword) {
+        if (keyword == null || keyword.isBlank()) {
+            return null;
+        }
+        JsonNode root = postSearch(keyword.trim());
+        return firstMatchingResult(root, keyword.trim());
     }
 
     private static JsonNode postSearch(String keyword) {

@@ -177,6 +177,7 @@ public final class DownloadWorker implements Runnable {
     private final int workerSlot;
     private final Map<String, DownloadHints> downloadHintsByTargetKey;
     private final Map<String, String> detailUrlByTargetKey;
+    private final boolean persistRunState;
 
     public DownloadWorker(
         Queue<KeywordTarget> keywordQueue,
@@ -189,6 +190,32 @@ public final class DownloadWorker implements Runnable {
         Map<String, DownloadHints> downloadHintsByTargetKey,
         Map<String, String> detailUrlByTargetKey
     ) {
+        this(
+            keywordQueue,
+            baseUrl,
+            baseDownloadDir,
+            maxRetries,
+            stats,
+            stopRequested,
+            workerSlot,
+            downloadHintsByTargetKey,
+            detailUrlByTargetKey,
+            true
+        );
+    }
+
+    public DownloadWorker(
+        Queue<KeywordTarget> keywordQueue,
+        String baseUrl,
+        Path baseDownloadDir,
+        int maxRetries,
+        RunStats stats,
+        AtomicBoolean stopRequested,
+        int workerSlot,
+        Map<String, DownloadHints> downloadHintsByTargetKey,
+        Map<String, String> detailUrlByTargetKey,
+        boolean persistRunState
+    ) {
         this.keywordQueue = keywordQueue;
         this.baseUrl = baseUrl;
         this.baseDownloadDir = baseDownloadDir;
@@ -198,6 +225,7 @@ public final class DownloadWorker implements Runnable {
         this.workerSlot = Math.max(1, workerSlot);
         this.downloadHintsByTargetKey = downloadHintsByTargetKey == null ? Map.of() : downloadHintsByTargetKey;
         this.detailUrlByTargetKey = detailUrlByTargetKey == null ? Map.of() : detailUrlByTargetKey;
+        this.persistRunState = persistRunState;
     }
 
     public static void prepareBidInfoOutput() {
@@ -425,7 +453,9 @@ public final class DownloadWorker implements Runnable {
                         Utils.logStatus(keyword, "SUCCESS", attempt,
                             "Finished.");
                         stats.markSuccess();
-                        RunStateStore.markSuccess(target, attempt, downloadedFilesCount);
+                        if (persistRunState) {
+                            RunStateStore.markSuccess(target, attempt, downloadedFilesCount);
+                        }
                         stats.addProcessedRecord(new RunStats.ProcessedRecord(
                             keyword,
                             target.folderPath() == null ? null : target.folderPath().toAbsolutePath().normalize().toString(),
@@ -453,7 +483,9 @@ public final class DownloadWorker implements Runnable {
 
                 if (!success) {
                     if (shouldStop()) {
-                        RunStateStore.markStopped(target, successAttempt, "Stopped by user", downloadedFilesCount);
+                        if (persistRunState) {
+                            RunStateStore.markStopped(target, successAttempt, "Stopped by user", downloadedFilesCount);
+                        }
                         stats.addProcessedRecord(new RunStats.ProcessedRecord(
                             keyword,
                             target.folderPath() == null ? null : target.folderPath().toAbsolutePath().normalize().toString(),
@@ -468,7 +500,9 @@ public final class DownloadWorker implements Runnable {
                     stats.markFail();
                     stats.addFailure(keyword, maxAttempts, lastErrorMessage,
                         Thread.currentThread().threadId());
-                    RunStateStore.markFailure(target, maxAttempts, lastErrorMessage, downloadedFilesCount);
+                    if (persistRunState) {
+                        RunStateStore.markFailure(target, maxAttempts, lastErrorMessage, downloadedFilesCount);
+                    }
                     stats.addProcessedRecord(new RunStats.ProcessedRecord(
                         keyword,
                         target.folderPath() == null ? null : target.folderPath().toAbsolutePath().normalize().toString(),
@@ -489,7 +523,9 @@ public final class DownloadWorker implements Runnable {
             completedWithoutStop = !shouldStop();
         } catch (CancellationException ex) {
             if (activeTarget != null) {
-                RunStateStore.markStopped(activeTarget, 0, "Stopped by user", activeDownloadedFilesCount);
+                if (persistRunState) {
+                    RunStateStore.markStopped(activeTarget, 0, "Stopped by user", activeDownloadedFilesCount);
+                }
                 stats.addProcessedRecord(new RunStats.ProcessedRecord(
                     activeTarget.keyword(),
                     activeTarget.folderPath() == null ? null : activeTarget.folderPath().toAbsolutePath().normalize().toString(),
@@ -559,7 +595,7 @@ public final class DownloadWorker implements Runnable {
             navigateToDetailPage(driver, keyword);
         }
 
-        // Store stable API params for later monitor/API-based sheet sync.
+        // Store stable API params for later API-based sheet sync.
         String detailUrl = driver.getCurrentUrl();
         BidTrackingRecordStore.upsertFromDetailUrl(target, detailUrl);
         Utils.logStatus(keyword, "INFO", 0,

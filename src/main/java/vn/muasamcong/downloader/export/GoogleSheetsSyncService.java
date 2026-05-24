@@ -442,6 +442,7 @@ public final class GoogleSheetsSyncService {
         }
 
         LinkedHashMap<String, Integer> statusCounts = new LinkedHashMap<>();
+        statusCounts.put("Đã hủy TBMT", 0);
         statusCounts.put("Mời thầu", 0);
         statusCounts.put("Đã đóng thầu", 0);
         statusCounts.put("Mở thầu", 0);
@@ -509,9 +510,10 @@ public final class GoogleSheetsSyncService {
                     continue;
                 }
                 int startColumn = range.path("startColumnIndex").asInt(0);
-                int endColumn = range.path("endColumnIndex").asInt(0);
+                int endColumn = range.path("endColumnIndex").asInt(Integer.MAX_VALUE);
                 int startRow = range.path("startRowIndex").asInt(0);
-                if (startRow == 0 && startColumn == 0 && endColumn == 7) {
+                int endRow = range.path("endRowIndex").asInt(Integer.MAX_VALUE);
+                if (rangesOverlap(startRow, endRow, startColumn, endColumn, 0, rowCount, 0, 7)) {
                     int bandedRangeId = bandedRange.path("bandedRangeId").asInt(-1);
                     if (bandedRangeId > 0) {
                         requests.add(Map.of(
@@ -717,6 +719,22 @@ public final class GoogleSheetsSyncService {
 
         HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         ensureOk(response, "apply index sheet presentation");
+    }
+
+    private static boolean rangesOverlap(
+        int startRow,
+        int endRow,
+        int startColumn,
+        int endColumn,
+        int targetStartRow,
+        int targetEndRow,
+        int targetStartColumn,
+        int targetEndColumn
+    ) {
+        return startRow < targetEndRow
+            && endRow > targetStartRow
+            && startColumn < targetEndColumn
+            && endColumn > targetStartColumn;
     }
 
     private static void addIndexSummaryCardRequests(List<Map<String, Object>> requests, int sheetId) {
@@ -935,6 +953,7 @@ public final class GoogleSheetsSyncService {
         }
 
         List<Map<String, Object>> values = List.of(
+            Map.of("userEnteredValue", "Đã hủy TBMT"),
             Map.of("userEnteredValue", "Mời thầu"),
             Map.of("userEnteredValue", "Đã đóng thầu"),
             Map.of("userEnteredValue", "Mở thầu"),
@@ -1117,6 +1136,28 @@ public final class GoogleSheetsSyncService {
                     "endRowIndex", dataRowEnd,
                     "startColumnIndex", 4,
                     "endColumnIndex", 5
+                ),
+                "cell", Map.of(
+                    "userEnteredFormat", Map.of(
+                        "numberFormat", Map.of(
+                            "type", "CURRENCY",
+                            "pattern", "#,##0 \"đ\""
+                        ),
+                        "horizontalAlignment", "RIGHT"
+                    )
+                ),
+                "fields", "userEnteredFormat(numberFormat,horizontalAlignment)"
+            )
+        ));
+
+        requests.add(Map.of(
+            "repeatCell", Map.of(
+                "range", Map.of(
+                    "sheetId", sheetId,
+                    "startRowIndex", 1,
+                    "endRowIndex", dataRowEnd,
+                    "startColumnIndex", 7,
+                    "endColumnIndex", 8
                 ),
                 "cell", Map.of(
                     "userEnteredFormat", Map.of(
@@ -1428,6 +1469,7 @@ public final class GoogleSheetsSyncService {
 
     private static List<Map<String, Object>> buildStatusRules(int sheetId) {
         List<Map<String, Object>> rules = new ArrayList<>();
+        rules.add(buildStatusRule(sheetId, "Đã hủy TBMT", color(0.85, 0.85, 0.85), color(0.30, 0.30, 0.30)));
         rules.add(buildStatusRule(sheetId, "Mời thầu", color(0.97, 0.84, 0.85), null));
         rules.add(buildStatusRule(sheetId, "Đã đóng thầu", color(0.72, 0.11, 0.11), color(1.00, 1.00, 1.00)));
         rules.add(buildStatusRule(sheetId, "Mở thầu", color(0.85, 0.95, 0.85), null));
@@ -1675,6 +1717,7 @@ public final class GoogleSheetsSyncService {
             return "";
         }
         return switch (status) {
+            case TBMT_CANCELLED -> "Đã hủy TBMT";
             case INVITATION_OPEN -> "Mời thầu";
             case BIDDING_CLOSED -> "Đã đóng thầu";
             case BID_OPENED -> "Mở thầu";

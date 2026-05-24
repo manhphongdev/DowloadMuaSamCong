@@ -20,7 +20,7 @@ public final class ArtifactFingerprintStore {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss");
     private static final int SCHEMA_VERSION = 1;
-    private static final Path STORAGE_FILE = Utils.dataFile("monitor_artifact_fingerprints.json");
+    private static final Path STORAGE_FILE = Utils.dataFile("artifact_fingerprints.json");
     private static final Object LOCK = new Object();
 
     private ArtifactFingerprintStore() {

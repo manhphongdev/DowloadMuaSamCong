@@ -3,6 +3,7 @@ package vn.muasamcong.downloader.app;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Scanner;
+import vn.muasamcong.downloader.core.AppFeatures;
 import vn.muasamcong.downloader.core.DownloadCoordinator;
 
 public final class MainApp {
@@ -13,6 +14,10 @@ public final class MainApp {
     }
 
     public static void main(String[] args) {
+        if (!AppFeatures.isDownloadEnabled()) {
+            System.err.println("Selenium download is disabled. Launch DownloaderFxApp for Monitor / Export Sheet.");
+            return;
+        }
         Scanner scanner = new Scanner(System.in);
         Path rootFolder = resolveRootFolder(args, scanner);
         int concurrency = resolveConcurrency(args, scanner);
