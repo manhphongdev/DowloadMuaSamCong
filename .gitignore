@@ -44,3 +44,8 @@ cache/
 *.key
 *.pem
 *credentials*.json
+cookies.txt
+api_probe_*.txt
+api_probe_*.json
+*_probe_*.txt
+*_probe_*.json

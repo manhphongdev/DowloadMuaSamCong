@@ -4,8 +4,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.text.Normalizer;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.function.Predicate;
 
 /**
@@ -24,23 +26,16 @@ public final class KqlcntAgentFileExtractor {
 
     public static List<AgentFileRef> from(JsonNode kqlcntMain) {
         List<AgentFileRef> refs = new ArrayList<>();
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
         if (kqlcntMain == null || kqlcntMain.isMissingNode() || kqlcntMain.isNull()) {
             return refs;
         }
-        String decisionFileId = text(kqlcntMain, "decisionFileId");
-        String decisionFileName = text(kqlcntMain, "decisionFileName");
-        if (!isBlank(decisionFileId)) {
-            refs.add(new AgentFileRef(decisionFileId, decisionFileName));
-        }
-
-        AgentFileRef evalReport = evalReportRef(kqlcntMain);
-        if (evalReport != null) {
-            refs.add(evalReport);
-        }
-        AgentFileRef ehsdtReport = ehsdtSummaryReportRef(kqlcntMain);
-        if (ehsdtReport != null && !sameFileId(evalReport, ehsdtReport)) {
-            refs.add(ehsdtReport);
-        }
+        addUnique(refs, seen, decisionRef(kqlcntMain));
+        addUnique(refs, seen, evalReportRef(kqlcntMain));
+        addUnique(refs, seen, ehsdtSummaryReportRef(kqlcntMain));
+        addUnique(refs, seen, explicitReportRef(kqlcntMain));
+        addUnique(refs, seen, evalInfoRefs(kqlcntMain, item -> true));
+        addUnique(refs, seen, AgentFileRefCollector.collectFromJson(kqlcntMain, null));
         return refs;
     }
 
@@ -70,15 +65,10 @@ public final class KqlcntAgentFileExtractor {
         }
         String reportFileId = text(kqlcntMain, "reportFileId");
         String reportFileName = text(kqlcntMain, "reportFileName");
-        if (isBlank(reportFileId)
-            || isEhsdtSummaryReportTitle(reportFileName)
-            || looksLikeBidPackageDoc(reportFileName)) {
+        if (isBlank(reportFileId) || isEhsdtSummaryReportTitle(reportFileName)) {
             return null;
         }
-        if (looksLikeExpertEvalReportTitle(reportFileName)) {
-            return new AgentFileRef(reportFileId, reportFileName);
-        }
-        return null;
+        return new AgentFileRef(reportFileId, reportFileName);
     }
 
     /**
@@ -121,26 +111,72 @@ public final class KqlcntAgentFileExtractor {
     }
 
     private static AgentFileRef firstEvalInfoItem(JsonNode kqlcntMain, Predicate<JsonNode> accept) {
+        List<AgentFileRef> refs = evalInfoRefs(kqlcntMain, accept);
+        return refs.isEmpty() ? null : refs.get(0);
+    }
+
+    private static List<AgentFileRef> evalInfoRefs(JsonNode kqlcntMain, Predicate<JsonNode> accept) {
+        List<AgentFileRef> refs = new ArrayList<>();
         String raw = text(kqlcntMain, "evalReportFileInfo");
         if (isBlank(raw)) {
-            return null;
+            JsonNode value = kqlcntMain == null ? null : kqlcntMain.get("evalReportFileInfo");
+            if (value == null || !value.isArray()) {
+                return refs;
+            }
+            collectEvalInfoRefs(value, accept, refs);
+            return refs;
         }
         try {
             JsonNode array = MAPPER.readTree(raw);
             if (array == null || !array.isArray()) {
-                return null;
+                return refs;
             }
-            for (JsonNode item : array) {
-                String fileId = text(item, "fileId");
-                if (isBlank(fileId) || (accept != null && !accept.test(item))) {
-                    continue;
-                }
-                return new AgentFileRef(fileId, text(item, "fileName"));
-            }
+            collectEvalInfoRefs(array, accept, refs);
         } catch (Exception ex) {
+            return refs;
+        }
+        return refs;
+    }
+
+    private static void collectEvalInfoRefs(JsonNode array, Predicate<JsonNode> accept, List<AgentFileRef> refs) {
+        if (array == null || !array.isArray()) {
+            return;
+        }
+        for (JsonNode item : array) {
+            String fileId = text(item, "fileId");
+            if (isBlank(fileId) || (accept != null && !accept.test(item))) {
+                continue;
+            }
+            refs.add(new AgentFileRef(fileId, text(item, "fileName")));
+        }
+    }
+
+    private static AgentFileRef explicitReportRef(JsonNode kqlcntMain) {
+        if (kqlcntMain == null) {
             return null;
         }
-        return null;
+        String fileId = text(kqlcntMain, "reportFileId");
+        if (isBlank(fileId)) {
+            return null;
+        }
+        return new AgentFileRef(fileId, text(kqlcntMain, "reportFileName"));
+    }
+
+    private static void addUnique(List<AgentFileRef> target, Set<String> seen, AgentFileRef ref) {
+        if (ref == null || isBlank(ref.fileId()) || seen.contains(ref.fileId())) {
+            return;
+        }
+        seen.add(ref.fileId());
+        target.add(ref);
+    }
+
+    private static void addUnique(List<AgentFileRef> target, Set<String> seen, List<AgentFileRef> refs) {
+        if (refs == null) {
+            return;
+        }
+        for (AgentFileRef ref : refs) {
+            addUnique(target, seen, ref);
+        }
     }
 
     private static boolean isEvalReportType(String type) {

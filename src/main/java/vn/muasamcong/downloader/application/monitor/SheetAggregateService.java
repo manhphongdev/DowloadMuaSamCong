@@ -54,6 +54,22 @@ public final class SheetAggregateService {
         return new SheetRefreshResult(rows.size(), List.copyOf(sheetDataChangedKeys), sheetChanged, false);
     }
 
+    /** Writes all in-memory package rows to bid_sheet_rows.json (used for periodic sheet export). */
+    public SheetRefreshResult writeAllRowsToJson(Path bidRowsJsonFile) {
+        if (Thread.currentThread().isInterrupted()) {
+            return new SheetRefreshResult(0, List.of(), false, true);
+        }
+        List<BidSheetRow> rows = new ArrayList<>();
+        for (BidPackage pkg : packageRepository.findAll()) {
+            if (pkg != null && pkg.sheetRow() != null) {
+                rows.add(pkg.sheetRow());
+            }
+        }
+        DownloadWorker.replaceBidInfoRows(rows);
+        Utils.logPlain("Bid sheet rows written for export. rows=" + rows.size());
+        return new SheetRefreshResult(rows.size(), List.of(), true, false);
+    }
+
     private static Set<String> loadExistingRowKeys(Path jsonFile) {
         LinkedHashSet<String> keys = new LinkedHashSet<>();
         Path file = jsonFile == null ? Utils.dataFile("bid_sheet_rows.json") : jsonFile;

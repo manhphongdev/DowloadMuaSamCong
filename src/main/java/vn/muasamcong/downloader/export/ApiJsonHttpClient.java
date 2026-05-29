@@ -19,6 +19,18 @@ final class ApiJsonHttpClient {
     }
 
     static JsonNode postJson(HttpClient client, ObjectMapper mapper, URI uri, String body, Duration timeout, String label) {
+        return postJson(client, mapper, uri, body, timeout, label, true);
+    }
+
+    static JsonNode postJson(
+        HttpClient client,
+        ObjectMapper mapper,
+        URI uri,
+        String body,
+        Duration timeout,
+        String label,
+        boolean logFailures
+    ) {
         if (client == null || mapper == null || uri == null || body == null) {
             return null;
         }
@@ -42,32 +54,45 @@ final class ApiJsonHttpClient {
                     if (isRetryableStatus(status) && retryAfterDelay(attempt)) {
                         continue;
                     }
-                    Utils.logPlain(context + " failed: HTTP " + status);
+                    logFailure(logFailures, context + " failed: HTTP " + status);
                     return null;
                 }
                 if (!looksLikeJson(responseBody)) {
                     if (retryAfterDelay(attempt)) {
                         continue;
                     }
-                    String contentType = response.headers().firstValue("content-type").orElse("unknown");
-                    Utils.logPlain(context + " failed: non-JSON response (HTTP " + status
-                        + ", content-type " + contentType + ", starts with " + preview(responseBody) + ")");
+                    if (logFailures) {
+                        String contentType = response.headers().firstValue("content-type").orElse("unknown");
+                        logFailure(
+                            true,
+                            context + " failed: non-JSON response (HTTP " + status
+                                + ", content-type " + contentType + ", starts with " + preview(responseBody) + ")"
+                        );
+                    }
                     return null;
                 }
                 return mapper.readTree(responseBody);
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
-                Utils.logPlain(context + " failed: interrupted");
+                if (!BidSheetApiSyncService.isMonitorStopping()) {
+                    logFailure(logFailures, context + " failed: interrupted");
+                }
                 return null;
             } catch (Exception ex) {
                 if (retryAfterDelay(attempt)) {
                     continue;
                 }
-                Utils.logPlain(context + " failed: " + ex.getMessage());
+                logFailure(logFailures, context + " failed: " + ex.getMessage());
                 return null;
             }
         }
         return null;
+    }
+
+    private static void logFailure(boolean logFailures, String message) {
+        if (logFailures) {
+            Utils.logPlain(message);
+        }
     }
 
     private static boolean isRetryableStatus(int status) {

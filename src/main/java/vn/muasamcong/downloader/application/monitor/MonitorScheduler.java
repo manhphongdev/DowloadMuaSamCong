@@ -17,6 +17,8 @@ import vn.muasamcong.downloader.domain.monitor.MonitorCycleLog;
 import vn.muasamcong.downloader.domain.monitor.MonitorCycleRepository;
 import vn.muasamcong.downloader.domain.monitor.MonitorSettings;
 import vn.muasamcong.downloader.domain.monitor.MonitorSettingsRepository;
+import vn.muasamcong.downloader.application.sheet.SheetPublishService;
+import vn.muasamcong.downloader.application.sheet.SheetRefreshResult;
 import vn.muasamcong.downloader.infrastructure.persistence.JsonMonitorCycleRepository;
 import vn.muasamcong.downloader.infrastructure.persistence.JsonMonitorSettingsRepository;
 import vn.muasamcong.downloader.infrastructure.persistence.JsonPackageRepository;
@@ -30,11 +32,17 @@ public final class MonitorScheduler {
     private final MonitorCycleService cycleService;
     private final JsonPackageRepository packageRepository;
     private final MonitorDownloadPhaseService downloadPhaseService;
+    private final SheetAggregateService sheetAggregateService;
+    private final SheetPublishService sheetPublishService;
     private final Supplier<List<java.nio.file.Path>> rootsSupplier;
     private final AtomicBoolean cycleInProgress = new AtomicBoolean(false);
+    private volatile Thread activeCycleThread;
+    private volatile Runnable onCycleIdle = () -> { };
 
     private ScheduledExecutorService executor;
     private ScheduledFuture<?> scheduledFuture;
+    private ScheduledExecutorService sheetExportExecutor;
+    private ScheduledFuture<?> sheetExportFuture;
 
     public MonitorScheduler(
         Path bidRowsJsonFile,
@@ -46,6 +54,8 @@ public final class MonitorScheduler {
         this.packageRepository = new JsonPackageRepository();
         this.cycleService = new MonitorCycleService(bidRowsJsonFile, packageRepository, cycleRepository);
         this.downloadPhaseService = new MonitorDownloadPhaseService(packageRepository);
+        this.sheetAggregateService = new SheetAggregateService(packageRepository);
+        this.sheetPublishService = new SheetPublishService();
         this.rootsSupplier = rootsSupplier;
     }
 
@@ -68,10 +78,11 @@ public final class MonitorScheduler {
         long intervalMinutes = settings.intervalMinutes();
         scheduledFuture = executor.scheduleWithFixedDelay(
             this::runScheduledCycle,
-            0,
+            intervalMinutes,
             intervalMinutes,
             TimeUnit.MINUTES
         );
+        startPeriodicSheetExport();
         Utils.logPlain("Monitor scheduler started. Interval: " + intervalMinutes + " minute(s).");
     }
 
@@ -84,6 +95,7 @@ public final class MonitorScheduler {
             executor.shutdown();
             executor = null;
         }
+        stopPeriodicSheetExport();
     }
 
     public synchronized void restart() {
@@ -92,7 +104,25 @@ public final class MonitorScheduler {
     }
 
     public MonitorCycleResult runOnce() {
-        return runOnce(1);
+        MonitorSettings settings = settingsRepository.load().normalized();
+        return runOnce(settings.seleniumDownloadConcurrency());
+    }
+
+    public void setOnCycleIdle(Runnable callback) {
+        onCycleIdle = callback == null ? () -> { } : callback;
+    }
+
+    public boolean isCycleActive() {
+        return cycleInProgress.get() || ExecutionGate.isMonitorBusy();
+    }
+
+    public void requestStop() {
+        Utils.logPlain("Monitor: stop requested.");
+        MonitorCycleService.cancelActiveWork();
+        Thread cycleThread = activeCycleThread;
+        if (cycleThread != null) {
+            cycleThread.interrupt();
+        }
     }
 
     public MonitorCycleResult runOnce(int downloadConcurrency) {
@@ -104,6 +134,7 @@ public final class MonitorScheduler {
             return skippedCycleResult(reason);
         }
 
+        activeCycleThread = Thread.currentThread();
         boolean monitorReleased = false;
         try {
             List<java.nio.file.Path> roots = rootsSupplier.get();
@@ -111,37 +142,89 @@ public final class MonitorScheduler {
                 throw new IllegalArgumentException("No folders selected for monitor.");
             }
 
-            MonitorSettings settings = settingsRepository.load();
-            int concurrency = Math.max(1, Math.min(10, downloadConcurrency));
+            MonitorSettings settings = settingsRepository.load().normalized();
+            int seleniumConcurrency = downloadConcurrency > 0
+                ? downloadConcurrency
+                : settings.seleniumDownloadConcurrency();
             MonitorCycleRequest request = new MonitorCycleRequest(
                 roots,
                 settings.downloadFilesAfterSheet(),
-                concurrency
+                seleniumConcurrency,
+                settings.bbmtSeleniumDownload()
             );
 
-            MonitorCycleResult phase1 = cycleService.run(request);
-            if (!shouldRunDownloadPhase(request, phase1)) {
-                return phase1;
+            MonitorCycleResult result = cycleService.run(request);
+            if (result.interrupted()) {
+                return result;
+            }
+            if (!request.downloadFilesAfterSheet()) {
+                return result;
             }
 
             ExecutionGate.endMonitor();
             monitorReleased = true;
 
-            if (!ExecutionGate.tryBeginDownload()) {
-                Utils.logPlain("Monitor download phase skipped: download gate busy.");
-                return phase1.withDownloadStats(0, 0, 0, 0);
+            if (!result.parallelAgentAndBbmt()
+                && AppFeatures.isMonitorBbmtSeleniumEnabled()
+                && request.bbmtSeleniumDownload()) {
+                result = runGatedDownloadPhase(result, request, roots, true);
             }
-
-            try {
-                return runDownloadPhase(phase1, request, roots);
-            } finally {
-                ExecutionGate.endDownload();
+            if (AppFeatures.isMonitorSeleniumFallbackEnabled()) {
+                result = runGatedDownloadPhase(result, request, roots, false);
             }
+            return result;
         } finally {
+            activeCycleThread = null;
             if (!monitorReleased) {
                 ExecutionGate.endMonitor();
             }
         }
+    }
+
+    private MonitorCycleResult runGatedDownloadPhase(
+        MonitorCycleResult phase1,
+        MonitorCycleRequest request,
+        List<Path> roots,
+        boolean bbmtOnly
+    ) {
+        if (!ExecutionGate.tryBeginDownload()) {
+            String label = bbmtOnly ? "BBMT" : "Selenium fallback";
+            Utils.logPlain("Monitor " + label + " download phase skipped: download gate busy.");
+            return phase1;
+        }
+        try {
+            return bbmtOnly
+                ? runBbmtDownloadPhase(phase1, request, roots)
+                : runDownloadPhase(phase1, request, roots);
+        } finally {
+            ExecutionGate.endDownload();
+        }
+    }
+
+    private MonitorCycleResult runBbmtDownloadPhase(
+        MonitorCycleResult phase1,
+        MonitorCycleRequest request,
+        List<Path> roots
+    ) {
+        Utils.logPlain("Monitor BBMT download phase starting...");
+        List<BidPackage> packages = packageRepository.findAll();
+        PackageDownloadPlan plan = downloadPhaseService.planBbmt(packages, roots);
+
+        int queued = plan.targets().size();
+        int skipped = plan.skippedCount();
+        if (queued == 0) {
+            Utils.logPlain("Monitor BBMT download phase: no targets queued.");
+            return mergeDownloadStats(phase1, 0, 0, 0, skipped);
+        }
+
+        RunStats stats = downloadPhaseService.execute(plan, request.downloadConcurrency());
+        downloadPhaseService.applyResults(packages, plan, stats);
+
+        int success = stats == null ? 0 : stats.getSuccessCount();
+        int failed = stats == null ? 0 : stats.getFailCount();
+        Utils.logPlain("Monitor BBMT download phase done: queued=" + queued
+            + ", success=" + success + ", failed=" + failed + ", skipped=" + skipped);
+        return mergeDownloadStats(phase1, queued, success, failed, skipped);
     }
 
     private MonitorCycleResult runDownloadPhase(
@@ -157,7 +240,7 @@ public final class MonitorScheduler {
         int skipped = plan.skippedCount();
         if (queued == 0) {
             Utils.logPlain("Monitor download phase: no targets queued.");
-            return phase1.withDownloadStats(0, 0, 0, skipped);
+            return mergeDownloadStats(phase1, 0, 0, 0, skipped);
         }
 
         RunStats stats = downloadPhaseService.execute(plan, request.downloadConcurrency());
@@ -167,20 +250,22 @@ public final class MonitorScheduler {
         int failed = stats == null ? 0 : stats.getFailCount();
         Utils.logPlain("Monitor download phase done: queued=" + queued
             + ", success=" + success + ", failed=" + failed + ", skipped=" + skipped);
-        return phase1.withDownloadStats(queued, success, failed, skipped);
+        return mergeDownloadStats(phase1, queued, success, failed, skipped);
     }
 
-    private static boolean shouldRunDownloadPhase(MonitorCycleRequest request, MonitorCycleResult phase1) {
-        if (request == null || phase1 == null) {
-            return false;
-        }
-        if (!request.downloadFilesAfterSheet()) {
-            return false;
-        }
-        if (!AppFeatures.isMonitorSeleniumAfterSheetEnabled()) {
-            return false;
-        }
-        return !phase1.interrupted();
+    private static MonitorCycleResult mergeDownloadStats(
+        MonitorCycleResult phase1,
+        int queued,
+        int success,
+        int failed,
+        int skipped
+    ) {
+        return phase1.withDownloadStats(
+            phase1.downloadQueued() + queued,
+            phase1.downloadSuccess() + success,
+            phase1.downloadFailed() + failed,
+            phase1.downloadSkipped() + skipped
+        );
     }
 
     private static MonitorCycleResult skippedCycleResult(String reason) {
@@ -225,6 +310,77 @@ public final class MonitorScheduler {
             Utils.logPlain("Monitor scheduled cycle failed: " + ex.getMessage());
         } finally {
             cycleInProgress.set(false);
+            notifyCycleIdle();
+        }
+    }
+
+    private void notifyCycleIdle() {
+        try {
+            onCycleIdle.run();
+        } catch (RuntimeException ignored) {
+            // UI callback must not break scheduler
+        }
+    }
+
+    private void startPeriodicSheetExport() {
+        stopPeriodicSheetExport();
+        if (sheetExportExecutor == null || sheetExportExecutor.isShutdown()) {
+            sheetExportExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread thread = new Thread(r, "Monitor-SheetExport");
+                thread.setDaemon(true);
+                return thread;
+            });
+        }
+        long intervalMinutes = AppFeatures.MONITOR_SHEET_EXPORT_INTERVAL_MINUTES;
+        sheetExportFuture = sheetExportExecutor.scheduleAtFixedRate(
+            this::runPeriodicSheetExport,
+            1,
+            intervalMinutes,
+            TimeUnit.MINUTES
+        );
+        Utils.logPlain("Monitor periodic sheet export started. First run in 1 minute, then every "
+            + intervalMinutes + " minute(s).");
+        if (!sheetPublishService.isAutoSyncEnabled()) {
+            Utils.logPlain("Google Sheets auto sync is OFF — periodic export will only refresh bid_sheet_rows.json locally.");
+        }
+    }
+
+    private void stopPeriodicSheetExport() {
+        if (sheetExportFuture != null) {
+            sheetExportFuture.cancel(false);
+            sheetExportFuture = null;
+        }
+        if (sheetExportExecutor != null) {
+            sheetExportExecutor.shutdown();
+            sheetExportExecutor = null;
+        }
+    }
+
+    private void runPeriodicSheetExport() {
+        MonitorSettings settings = settingsRepository.load();
+        if (!settings.enabled()) {
+            return;
+        }
+        if (ExecutionGate.isDownloadBusy()) {
+            Utils.logPlain("Periodic sheet export skipped: Selenium download in progress.");
+            return;
+        }
+        try {
+            SheetRefreshResult refresh = sheetAggregateService.writeAllRowsToJson(bidRowsJsonFile);
+            if (refresh.interrupted()) {
+                Utils.logPlain("Periodic sheet export interrupted.");
+                return;
+            }
+            if (refresh.rowCount() == 0) {
+                Utils.logPlain("Periodic sheet export skipped: no sheet rows (run monitor sync first).");
+                return;
+            }
+            boolean published = sheetPublishService.publishIfEnabled(bidRowsJsonFile);
+            Utils.logPlain("Periodic sheet export finished. rows=" + refresh.rowCount()
+                + (published ? ", pushed to Google Sheets" : ", local JSON only"));
+            notifyCycleIdle();
+        } catch (Exception ex) {
+            Utils.logPlain("Periodic sheet export failed: " + ex.getMessage());
         }
     }
 }

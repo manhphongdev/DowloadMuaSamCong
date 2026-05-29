@@ -33,6 +33,16 @@ public final class MonitorDownloadPhaseService {
         return plan;
     }
 
+    public PackageDownloadPlan planBbmt(List<BidPackage> packages, List<Path> selectedRoots) {
+        PackageDownloadPlan plan = PackageDownloadPlanner.planBbmtOnly(packages, selectedRoots);
+        for (String line : plan.skipLogLines()) {
+            Utils.logPlain("Monitor BBMT download skip: " + line);
+        }
+        Utils.logPlain("Monitor BBMT download plan: queued=" + plan.targets().size()
+            + ", skipped=" + plan.skippedCount());
+        return plan;
+    }
+
     public RunStats execute(PackageDownloadPlan plan, int concurrency) {
         if (plan == null || plan.targets().isEmpty()) {
             return null;

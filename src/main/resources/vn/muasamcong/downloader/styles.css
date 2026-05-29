@@ -57,6 +57,12 @@
     -fx-text-fill: #1f1f1f;
 }
 
+.section-title-small {
+    -fx-font-size: 14px;
+    -fx-font-weight: 700;
+    -fx-text-fill: #1f2937;
+}
+
 .field-label {
     -fx-font-size: 14px;
     -fx-font-weight: 600;
@@ -234,6 +240,90 @@
     -fx-font-size: 13px;
 }
 
+.progress-zoom-root {
+    -fx-background-color: #f8fafc;
+}
+
+.progress-zoom-root .progress-table-view .column-header .label,
+.progress-zoom-root .agent-file-table-view .column-header .label {
+    -fx-font-weight: 700;
+}
+
+.progress-zoom-100 .progress-table-view .table-cell,
+.progress-zoom-100 .agent-file-table-view .table-cell {
+    -fx-font-size: 13px;
+    -fx-padding: 8 10;
+}
+
+.progress-zoom-100 .progress-table-view .column-header .label,
+.progress-zoom-100 .agent-file-table-view .column-header .label {
+    -fx-font-size: 13px;
+}
+
+.progress-zoom-125 .progress-table-view .table-cell,
+.progress-zoom-125 .agent-file-table-view .table-cell {
+    -fx-font-size: 16px;
+    -fx-padding: 10 12;
+}
+
+.progress-zoom-125 .progress-table-view .column-header .label,
+.progress-zoom-125 .agent-file-table-view .column-header .label {
+    -fx-font-size: 15px;
+}
+
+.progress-zoom-150 .progress-table-view .table-cell,
+.progress-zoom-150 .agent-file-table-view .table-cell {
+    -fx-font-size: 19px;
+    -fx-padding: 12 14;
+}
+
+.progress-zoom-150 .progress-table-view .column-header .label,
+.progress-zoom-150 .agent-file-table-view .column-header .label {
+    -fx-font-size: 18px;
+}
+
+.agent-file-panel {
+    -fx-background-color: #f8fafc;
+    -fx-background-radius: 7;
+    -fx-border-color: #dbe2ea;
+    -fx-border-radius: 7;
+    -fx-padding: 10;
+}
+
+.agent-file-table-view {
+    -fx-background-color: #ffffff;
+    -fx-background-radius: 6;
+    -fx-border-color: #dbe2ea;
+    -fx-border-radius: 6;
+}
+
+.agent-file-table-view .column-header-background {
+    -fx-background-color: #f1f5f9;
+    -fx-background-radius: 6 6 0 0;
+}
+
+.agent-file-table-view .table-cell {
+    -fx-text-fill: #0f172a;
+    -fx-padding: 7 9;
+    -fx-border-color: transparent;
+    -fx-font-size: 12.5px;
+}
+
+.progress-zoom-100 .agent-file-table-view .table-cell {
+    -fx-font-size: 13px;
+    -fx-padding: 8 10;
+}
+
+.progress-zoom-125 .agent-file-table-view .table-cell {
+    -fx-font-size: 16px;
+    -fx-padding: 10 12;
+}
+
+.progress-zoom-150 .agent-file-table-view .table-cell {
+    -fx-font-size: 19px;
+    -fx-padding: 12 14;
+}
+
 .badge {
     -fx-background-radius: 999;
     -fx-padding: 3 10;
@@ -248,9 +338,28 @@
     -fx-background-color: #dcfce7;
     -fx-text-fill: #15803d;
 }
+.badge-amber {
+    -fx-background-color: #fef3c7;
+    -fx-text-fill: #b45309;
+}
+.badge-purple {
+    -fx-background-color: #ede9fe;
+    -fx-text-fill: #6d28d9;
+}
 .badge-red {
     -fx-background-color: #fee2e2;
     -fx-text-fill: #b91c1c;
+}
+
+.activity-label {
+    -fx-background-color: #f8fafc;
+    -fx-background-radius: 6;
+    -fx-border-color: #e5e7eb;
+    -fx-border-radius: 6;
+    -fx-padding: 7 10;
+    -fx-text-fill: #334155;
+    -fx-font-size: 12.5px;
+    -fx-font-weight: 600;
 }
 
 .button {
@@ -345,6 +454,27 @@
 .status-error {
     -fx-text-fill: #dc2626;
     -fx-font-weight: 700;
+}
+
+.toast-notification {
+    -fx-background-radius: 8;
+    -fx-border-radius: 8;
+    -fx-padding: 10 14;
+    -fx-font-size: 13px;
+    -fx-font-weight: 700;
+    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.18), 14, 0.18, 0, 4);
+}
+
+.toast-success {
+    -fx-background-color: #dcfce7;
+    -fx-border-color: #86efac;
+    -fx-text-fill: #166534;
+}
+
+.toast-error {
+    -fx-background-color: #fee2e2;
+    -fx-border-color: #fca5a5;
+    -fx-text-fill: #991b1b;
 }
 
 .progress-indicator {

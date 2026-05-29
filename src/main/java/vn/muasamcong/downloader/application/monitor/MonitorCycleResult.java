@@ -15,7 +15,8 @@ public record MonitorCycleResult(
     int downloadQueued,
     int downloadSuccess,
     int downloadFailed,
-    int downloadSkipped
+    int downloadSkipped,
+    boolean parallelAgentAndBbmt
 ) {
 
     public MonitorCycleResult(
@@ -42,7 +43,8 @@ public record MonitorCycleResult(
             0,
             0,
             0,
-            0
+            0,
+            false
         );
     }
 
@@ -68,7 +70,8 @@ public record MonitorCycleResult(
             queued,
             success,
             failed,
-            skipped
+            skipped,
+            parallelAgentAndBbmt
         );
     }
 }

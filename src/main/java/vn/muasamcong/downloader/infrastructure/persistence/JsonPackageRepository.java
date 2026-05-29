@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -136,9 +138,19 @@ public final class JsonPackageRepository implements PackageRepository {
         );
         try {
             String content = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(payload);
-            Files.writeString(STORAGE_FILE, content + System.lineSeparator(), StandardCharsets.UTF_8);
+            writeAtomically(STORAGE_FILE, content + System.lineSeparator());
         } catch (IOException ex) {
             throw new RuntimeException("Unable to write bid packages: " + STORAGE_FILE.toAbsolutePath(), ex);
+        }
+    }
+
+    private static void writeAtomically(Path file, String content) throws IOException {
+        Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+        Files.writeString(temp, content, StandardCharsets.UTF_8);
+        try {
+            Files.move(temp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException ex) {
+            Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 

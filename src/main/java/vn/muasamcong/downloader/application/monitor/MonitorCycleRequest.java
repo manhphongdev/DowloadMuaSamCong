@@ -6,11 +6,12 @@ import java.util.List;
 public record MonitorCycleRequest(
     List<Path> selectedRoots,
     boolean downloadFilesAfterSheet,
-    int downloadConcurrency
+    int downloadConcurrency,
+    boolean bbmtSeleniumDownload
 ) {
 
     public MonitorCycleRequest(List<Path> selectedRoots) {
-        this(selectedRoots, false, 1);
+        this(selectedRoots, false, 1, true);
     }
 
     public MonitorCycleRequest {

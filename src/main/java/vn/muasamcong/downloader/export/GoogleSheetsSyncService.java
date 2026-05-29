@@ -42,7 +42,10 @@ public final class GoogleSheetsSyncService {
     private static final Pattern KEYWORD_FOLDER_PATTERN = Pattern.compile("^\\s*\\d+\\s*\\.\\s*IB[A-Za-z0-9]+(?=\\.|\\s|$)", Pattern.CASE_INSENSITIVE);
     private static final int STATUS_COLUMN_INDEX = 8; // column I, zero-based
     private static final int REMAINING_COLUMN_INDEX = 10; // column K, zero-based
+    private static final int FOLDER_LINK_COLUMN_INDEX = 11; // column L, zero-based
     private static final int TOTAL_COLUMN_COUNT = 12; // A..L
+    private static final int REMAINING_COLUMN_WIDTH_PX = 215;
+    private static final int FOLDER_LINK_COLUMN_WIDTH_PX = 520;
     private static final DateTimeFormatter INDEX_TIME_FORMAT = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
     private static final List<String> OUTPUT_HEADERS = List.of(
         "Số TBMT",
@@ -70,32 +73,49 @@ public final class GoogleSheetsSyncService {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final DateTimeFormatter DATE_TIME_FORMAT = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm");
     private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
+    private static final int SHEET_VALUE_BATCH_SIZE = 8;
 
     private GoogleSheetsSyncService() {
     }
 
-    public static void syncFromJsonIfEnabled(Path jsonFile) {
+    public static boolean syncFromJsonIfEnabled(Path jsonFile) {
         GoogleSheetsConfigStore.GoogleSheetsConfig config = GoogleSheetsConfigStore.resolve();
         if (!config.autoSync()) {
-            return;
+            Utils.logPlain(
+                "Google Sheets publish skipped: enable auto sync in Sheets config (menu Sheets / google_sheets_config.json).");
+            return false;
+        }
+        if (config.spreadsheetId() == null || config.spreadsheetId().isBlank()) {
+            Utils.logPlain("Google Sheets publish skipped: spreadsheet ID is not configured.");
+            return false;
+        }
+        if (config.credentialsFile() == null || config.credentialsFile().isBlank()) {
+            Utils.logPlain("Google Sheets publish skipped: credentials JSON path is not configured.");
+            return false;
         }
 
         try {
-            int rowCount = syncFromJson(jsonFile, config);
+            int rowCount = syncFromJson(jsonFile, config, true);
             Utils.logPlain("Google Sheets sync completed. Rows: " + rowCount);
+            return true;
         } catch (Exception ex) {
             Utils.logPlain("Google Sheets sync failed: " + summarizeError(ex));
+            return false;
         }
     }
 
     public static void syncFromJsonNow(Path jsonFile) throws Exception {
         GoogleSheetsConfigStore.GoogleSheetsConfig config = GoogleSheetsConfigStore.resolve();
-        syncFromJson(jsonFile, config);
+        syncFromJson(jsonFile, config, true);
     }
 
-    private static int syncFromJson(Path jsonFile, GoogleSheetsConfigStore.GoogleSheetsConfig config) throws Exception {
+    private static int syncFromJson(
+        Path jsonFile,
+        GoogleSheetsConfigStore.GoogleSheetsConfig config,
+        boolean applyPresentation
+    ) throws Exception {
         List<BidSheetRow> rows = readRowsFromJson(jsonFile);
-        syncRows(rows, config);
+        syncRows(rows, config, applyPresentation);
         return rows.size();
     }
 
@@ -210,7 +230,11 @@ public final class GoogleSheetsSyncService {
         return (text == null || text.isBlank()) ? null : text;
     }
 
-    private static void syncRows(List<BidSheetRow> rows, GoogleSheetsConfigStore.GoogleSheetsConfig config) throws Exception {
+    private static void syncRows(
+        List<BidSheetRow> rows,
+        GoogleSheetsConfigStore.GoogleSheetsConfig config,
+        boolean applyPresentation
+    ) throws Exception {
         String spreadsheetId = requireValue(config.spreadsheetId(), GoogleSheetsConfigStore.ENV_SPREADSHEET_ID);
         String fallbackSheetName = defaultIfBlank(config.sheetName(), DEFAULT_SHEET_NAME);
         Path credentialsFile = Path.of(requireValue(config.credentialsFile(), GoogleSheetsConfigStore.ENV_CREDENTIALS_FILE))
@@ -222,20 +246,31 @@ public final class GoogleSheetsSyncService {
 
         String accessToken = fetchAccessToken(credentialsFile);
         Map<String, List<BidSheetRow>> rowsBySheet = groupRowsBySheetName(rows, fallbackSheetName);
+        SpreadsheetMetadataCache metadata = new SpreadsheetMetadataCache(spreadsheetId, accessToken);
+        Utils.logPlain("Google Sheets sync starting: " + rowsBySheet.size() + " tab(s), " + rows.size() + " row(s)."
+            + (applyPresentation ? " (with formatting)" : " (values only, saves API quota)."));
         List<SheetOverview> sheetOverviews = new ArrayList<>();
+        for (Map.Entry<String, List<BidSheetRow>> entry : rowsBySheet.entrySet()) {
+            metadata.ensureSheetExists(entry.getKey());
+        }
+
+        List<String> dataSheetNames = new ArrayList<>(rowsBySheet.keySet());
+        batchClearRanges(spreadsheetId, dataSheetNames, accessToken);
+        batchUpdateSheetValues(spreadsheetId, rowsBySheet, accessToken);
+
+        int sheetIndex = 0;
         for (Map.Entry<String, List<BidSheetRow>> entry : rowsBySheet.entrySet()) {
             String sheetName = entry.getKey();
             List<BidSheetRow> sheetRows = entry.getValue();
+            if (applyPresentation) {
+                if (sheetIndex > 0 && sheetIndex % 6 == 0) {
+                    Thread.sleep(1_500L);
+                }
+                applySheetPresentation(metadata, sheetName, sortRows(sheetRows));
+                sheetIndex++;
+            }
 
-            ensureSheetExists(spreadsheetId, sheetName, accessToken);
-            clearDataRange(spreadsheetId, sheetName, accessToken);
-            updateDataRange(spreadsheetId, sheetName, sheetRows, accessToken);
-            applyTablePresentation(spreadsheetId, sheetName, Math.max(1, sheetRows.size() + 1), accessToken);
-            upsertStatusDataValidation(spreadsheetId, sheetName, accessToken);
-            upsertStatusConditionalFormatRules(spreadsheetId, sheetName, accessToken);
-            upsertRemainingConditionalFormatRule(spreadsheetId, sheetName, accessToken);
-
-            Integer sheetId = resolveSheetId(spreadsheetId, sheetName, accessToken);
+            Integer sheetId = metadata.resolveSheetId(sheetName);
             String navigationLink = sheetId == null
                 ? ""
                 : "https://docs.google.com/spreadsheets/d/" + spreadsheetId + "/edit#gid=" + sheetId;
@@ -248,7 +283,7 @@ public final class GoogleSheetsSyncService {
             ));
         }
 
-        syncIndexSheet(spreadsheetId, accessToken, sheetOverviews);
+        syncIndexSheet(metadata, sheetOverviews, applyPresentation);
     }
 
     private static Map<String, List<BidSheetRow>> groupRowsBySheetName(List<BidSheetRow> rows, String fallbackSheetName) {
@@ -324,10 +359,15 @@ public final class GoogleSheetsSyncService {
         return normalized;
     }
 
-    private static void syncIndexSheet(String spreadsheetId, String accessToken, List<SheetOverview> sheetOverviews) throws Exception {
+    private static void syncIndexSheet(
+        SpreadsheetMetadataCache metadata,
+        List<SheetOverview> sheetOverviews,
+        boolean applyPresentation
+    ) throws Exception {
         List<SheetOverview> sortedOverviews = sortSheetOverviews(sheetOverviews);
-        ensureSheetExists(spreadsheetId, INDEX_SHEET_NAME, accessToken);
-        clearDataRange(spreadsheetId, INDEX_SHEET_NAME, accessToken);
+        String spreadsheetId = metadata.spreadsheetId();
+        String accessToken = metadata.accessToken();
+        metadata.ensureSheetExists(INDEX_SHEET_NAME);
         updateSingleRange(
             spreadsheetId,
             toSheetA1Prefix(INDEX_SHEET_NAME) + "!" + INDEX_DATA_RANGE_START_A1,
@@ -342,7 +382,9 @@ public final class GoogleSheetsSyncService {
             accessToken,
             "USER_ENTERED"
         );
-        applyIndexSheetPresentation(spreadsheetId, accessToken, Math.max(1, sortedOverviews.size() + 1), sortedOverviews);
+        if (applyPresentation) {
+            applyIndexSheetPresentation(metadata, Math.max(1, sortedOverviews.size() + 1), sortedOverviews);
+        }
     }
 
     private static List<List<Object>> buildIndexValues(List<SheetOverview> sheetOverviews) {
@@ -472,34 +514,17 @@ public final class GoogleSheetsSyncService {
     }
 
     private static void applyIndexSheetPresentation(
-        String spreadsheetId,
-        String accessToken,
+        SpreadsheetMetadataCache metadata,
         int rowCount,
         List<SheetOverview> sheetOverviews
     ) throws Exception {
-        JsonNode root = readSpreadsheetMetadata(
-            spreadsheetId,
-            "sheets(properties(sheetId,title),bandedRanges(bandedRangeId,range))",
-            accessToken
-        );
-
-        Integer sheetId = null;
-        JsonNode targetSheet = null;
-        JsonNode sheets = root == null ? null : root.get("sheets");
-        if (sheets == null || !sheets.isArray()) {
-            return;
-        }
-        for (JsonNode sheet : sheets) {
-            String title = sheet.path("properties").path("title").asText("").trim();
-            if (INDEX_SHEET_NAME.equals(title)) {
-                sheetId = sheet.path("properties").path("sheetId").asInt();
-                targetSheet = sheet;
-                break;
-            }
-        }
+        JsonNode targetSheet = metadata.sheetNode(INDEX_SHEET_NAME);
+        Integer sheetId = metadata.resolveSheetId(INDEX_SHEET_NAME);
         if (sheetId == null || targetSheet == null) {
             return;
         }
+        String spreadsheetId = metadata.spreadsheetId();
+        String accessToken = metadata.accessToken();
 
         List<Map<String, Object>> requests = new ArrayList<>();
         JsonNode bandedRanges = targetSheet.get("bandedRanges");
@@ -709,16 +734,7 @@ public final class GoogleSheetsSyncService {
         addIndexNavigationLinkRequests(requests, sheetId, sheetOverviews);
         addIndexSummaryCardRequests(requests, sheetId);
 
-        String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + ":batchUpdate";
-        String payload = OBJECT_MAPPER.writeValueAsString(Map.of("requests", requests));
-        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-            .header("Authorization", "Bearer " + accessToken)
-            .header("Content-Type", "application/json; charset=UTF-8")
-            .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
-            .build();
-
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        ensureOk(response, "apply index sheet presentation");
+        executeSpreadsheetBatchUpdate(spreadsheetId, requests, accessToken, "apply index sheet presentation");
     }
 
     private static boolean rangesOverlap(
@@ -890,51 +906,160 @@ public final class GoogleSheetsSyncService {
     }
 
     private static void clearDataRange(String spreadsheetId, String sheetName, String accessToken) throws Exception {
-        String sheetPrefix = toSheetA1Prefix(sheetName);
-        clearSingleRange(spreadsheetId, sheetPrefix, accessToken);
+        clearSingleRange(spreadsheetId, toSheetA1Prefix(sheetName), accessToken);
     }
 
-    private static void ensureSheetExists(String spreadsheetId, String sheetName, String accessToken) throws Exception {
-        if (sheetExists(spreadsheetId, sheetName, accessToken)) {
+    private static void batchClearRanges(
+        String spreadsheetId,
+        List<String> sheetNames,
+        String accessToken
+    ) throws Exception {
+        if (sheetNames == null || sheetNames.isEmpty()) {
+            return;
+        }
+        List<String> ranges = new ArrayList<>(sheetNames.size() + 1);
+        for (String sheetName : sheetNames) {
+            ranges.add(toSheetA1Prefix(sheetName));
+        }
+        ranges.add(toSheetA1Prefix(INDEX_SHEET_NAME));
+
+        String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + "/values:batchClear";
+        for (int offset = 0; offset < ranges.size(); offset += 40) {
+            List<String> chunk = ranges.subList(offset, Math.min(offset + 40, ranges.size()));
+            String payload = OBJECT_MAPPER.writeValueAsString(Map.of("ranges", chunk));
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                .header("Authorization", "Bearer " + accessToken)
+                .header("Content-Type", "application/json; charset=UTF-8")
+                .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
+                .build();
+            sendWriteWithRetry(request, "batch clear " + chunk.size() + " sheet range(s)");
+        }
+    }
+
+    private static void batchUpdateSheetValues(
+        String spreadsheetId,
+        Map<String, List<BidSheetRow>> rowsBySheet,
+        String accessToken
+    ) throws Exception {
+        if (rowsBySheet == null || rowsBySheet.isEmpty()) {
+            return;
+        }
+        List<Map<String, Object>> payloads = new ArrayList<>();
+        for (Map.Entry<String, List<BidSheetRow>> entry : rowsBySheet.entrySet()) {
+            String sheetPrefix = toSheetA1Prefix(entry.getKey());
+            payloads.add(Map.of(
+                "range", sheetPrefix + "!" + DATA_RANGE_START_A1,
+                "majorDimension", "ROWS",
+                "values", buildValues(sortRows(entry.getValue()))
+            ));
+        }
+
+        String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + "/values:batchUpdate";
+        for (int offset = 0; offset < payloads.size(); offset += SHEET_VALUE_BATCH_SIZE) {
+            List<Map<String, Object>> chunk = payloads.subList(
+                offset,
+                Math.min(offset + SHEET_VALUE_BATCH_SIZE, payloads.size())
+            );
+            String body = OBJECT_MAPPER.writeValueAsString(Map.of(
+                "valueInputOption", "USER_ENTERED",
+                "data", chunk
+            ));
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                .header("Authorization", "Bearer " + accessToken)
+                .header("Content-Type", "application/json; charset=UTF-8")
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+            sendWriteWithRetry(request, "batch update values for " + chunk.size() + " tab(s)");
+        }
+    }
+
+    private static void sendWriteWithRetry(HttpRequest request, String action) throws Exception {
+        long delayMs = 5_000L;
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            HttpResponse<String> response = HTTP_CLIENT.send(
+                request,
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            try {
+                ensureOk(response, action);
+                return;
+            } catch (IllegalStateException ex) {
+                if (!isQuotaExceeded(ex) || attempt >= 5) {
+                    throw ex;
+                }
+                Utils.logPlain("Google Sheets write quota (429); retry " + attempt + "/5 in "
+                    + (delayMs / 1000) + "s...");
+                Thread.sleep(delayMs);
+                delayMs = Math.min(delayMs * 2, 60_000L);
+            }
+        }
+        throw new IllegalStateException("Google Sheets write failed after retries: " + action);
+    }
+
+    private static void executeSpreadsheetBatchUpdate(
+        String spreadsheetId,
+        List<Map<String, Object>> requests,
+        String accessToken,
+        String action
+    ) throws Exception {
+        if (requests == null || requests.isEmpty()) {
             return;
         }
         String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + ":batchUpdate";
-        String payload = OBJECT_MAPPER.writeValueAsString(Map.of(
-            "requests", List.of(
-                Map.of(
-                    "addSheet", Map.of(
-                        "properties", Map.of("title", sheetName)
-                    )
-                )
-            )
-        ));
-
+        String payload = OBJECT_MAPPER.writeValueAsString(Map.of("requests", requests));
         HttpRequest request = HttpRequest.newBuilder(URI.create(url))
             .header("Authorization", "Bearer " + accessToken)
             .header("Content-Type", "application/json; charset=UTF-8")
             .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
             .build();
-
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        ensureOk(response, "create sheet " + sheetName);
+        sendWriteWithRetry(request, action);
     }
 
-    private static boolean sheetExists(String spreadsheetId, String sheetName, String accessToken) throws Exception {
-        JsonNode root = readSpreadsheetMetadata(spreadsheetId, "sheets(properties(title))", accessToken);
-        JsonNode sheets = root == null ? null : root.get("sheets");
-        if (sheets == null || !sheets.isArray()) {
-            return false;
+    private static void applySheetPresentation(
+        SpreadsheetMetadataCache metadata,
+        String sheetName,
+        List<BidSheetRow> sortedRows
+    ) throws Exception {
+        JsonNode targetSheet = metadata.sheetNode(sheetName);
+        Integer sheetId = metadata.resolveSheetId(sheetName);
+        if (sheetId == null || targetSheet == null) {
+            return;
         }
-        for (JsonNode sheet : sheets) {
-            String title = sheet.path("properties").path("title").asText("").trim();
-            if (sheetName.equals(title)) {
-                return true;
-            }
-        }
-        return false;
+        int rowCount = Math.max(1, (sortedRows == null ? 0 : sortedRows.size()) + 1);
+        List<Map<String, Object>> requests = new ArrayList<>();
+        appendTablePresentationRequests(targetSheet, sheetId, rowCount, requests);
+        appendStatusDataValidationRequests(sheetId, requests);
+        appendStatusConditionalFormatRequests(targetSheet, sheetId, requests);
+        appendStatusCellFormatRequests(sheetId, sortedRows, requests);
+        appendRemainingConditionalFormatRequests(targetSheet, sheetId, requests);
+        executeSpreadsheetBatchUpdate(
+            metadata.spreadsheetId(),
+            requests,
+            metadata.accessToken(),
+            "apply sheet presentation " + sheetName
+        );
     }
 
     private static JsonNode readSpreadsheetMetadata(String spreadsheetId, String fields, String accessToken) throws Exception {
+        long delayMs = 5_000L;
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            try {
+                return readSpreadsheetMetadataOnce(spreadsheetId, fields, accessToken);
+            } catch (IllegalStateException ex) {
+                if (!isQuotaExceeded(ex) || attempt >= 5) {
+                    throw ex;
+                }
+                Utils.logPlain("Google Sheets read quota (429); retry " + attempt + "/5 in "
+                    + (delayMs / 1000) + "s...");
+                Thread.sleep(delayMs);
+                delayMs = Math.min(delayMs * 2, 60_000L);
+            }
+        }
+        throw new IllegalStateException("Google Sheets metadata read failed after retries.");
+    }
+
+    private static JsonNode readSpreadsheetMetadataOnce(String spreadsheetId, String fields, String accessToken)
+        throws Exception {
         String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + "?fields=" + urlEncode(fields);
         HttpRequest request = HttpRequest.newBuilder(URI.create(url))
             .header("Authorization", "Bearer " + accessToken)
@@ -945,13 +1070,13 @@ public final class GoogleSheetsSyncService {
         return OBJECT_MAPPER.readTree(response.body());
     }
 
-    private static void upsertStatusDataValidation(String spreadsheetId, String sheetName, String accessToken)
-        throws Exception {
-        Integer sheetId = resolveSheetId(spreadsheetId, sheetName, accessToken);
-        if (sheetId == null) {
-            return;
-        }
+    private static boolean isQuotaExceeded(Throwable ex) {
+        String message = ex == null ? null : ex.getMessage();
+        return message != null
+            && (message.contains("HTTP 429") || message.contains("Quota exceeded"));
+    }
 
+    private static void appendStatusDataValidationRequests(int sheetId, List<Map<String, Object>> requests) {
         List<Map<String, Object>> values = List.of(
             Map.of("userEnteredValue", "Đã hủy TBMT"),
             Map.of("userEnteredValue", "Mời thầu"),
@@ -961,86 +1086,35 @@ public final class GoogleSheetsSyncService {
             Map.of("userEnteredValue", "Có thông tin hợp đồng")
         );
 
-        Map<String, Object> requestBody = Map.of(
-            "requests", List.of(
-                Map.of(
-                    "repeatCell", Map.of(
-                        "range", Map.of(
-                            "sheetId", sheetId,
-                            "startRowIndex", 1,
-                            "startColumnIndex", STATUS_COLUMN_INDEX,
-                            "endColumnIndex", STATUS_COLUMN_INDEX + 1
+        requests.add(Map.of(
+            "repeatCell", Map.of(
+                "range", Map.of(
+                    "sheetId", sheetId,
+                    "startRowIndex", 1,
+                    "startColumnIndex", STATUS_COLUMN_INDEX,
+                    "endColumnIndex", STATUS_COLUMN_INDEX + 1
+                ),
+                "cell", Map.of(
+                    "dataValidation", Map.of(
+                        "condition", Map.of(
+                            "type", "ONE_OF_LIST",
+                            "values", values
                         ),
-                        "cell", Map.of(
-                            "dataValidation", Map.of(
-                                "condition", Map.of(
-                                    "type", "ONE_OF_LIST",
-                                    "values", values
-                                ),
-                                "showCustomUi", true,
-                                "strict", false
-                            )
-                        ),
-                        "fields", "dataValidation"
+                        "showCustomUi", true,
+                        "strict", false
                     )
-                )
+                ),
+                "fields", "dataValidation"
             )
-        );
-
-        String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + ":batchUpdate";
-        String payload = OBJECT_MAPPER.writeValueAsString(requestBody);
-        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-            .header("Authorization", "Bearer " + accessToken)
-            .header("Content-Type", "application/json; charset=UTF-8")
-            .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
-            .build();
-
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        ensureOk(response, "apply status data validation");
+        ));
     }
 
-    private static Integer resolveSheetId(String spreadsheetId, String sheetName, String accessToken) throws Exception {
-        JsonNode root = readSpreadsheetMetadata(spreadsheetId, "sheets(properties(sheetId,title))", accessToken);
-        JsonNode sheets = root == null ? null : root.get("sheets");
-        if (sheets == null || !sheets.isArray()) {
-            return null;
-        }
-        for (JsonNode sheet : sheets) {
-            String title = sheet.path("properties").path("title").asText("").trim();
-            if (sheetName.equals(title)) {
-                return sheet.path("properties").path("sheetId").asInt();
-            }
-        }
-        return null;
-    }
-
-    private static void applyTablePresentation(String spreadsheetId, String sheetName, int rowCount, String accessToken)
-        throws Exception {
-        JsonNode root = readSpreadsheetMetadata(
-            spreadsheetId,
-            "sheets(properties(sheetId,title),bandedRanges(bandedRangeId,range))",
-            accessToken
-        );
-
-        Integer sheetId = null;
-        JsonNode targetSheet = null;
-        JsonNode sheets = root == null ? null : root.get("sheets");
-        if (sheets == null || !sheets.isArray()) {
-            return;
-        }
-        for (JsonNode sheet : sheets) {
-            String title = sheet.path("properties").path("title").asText("").trim();
-            if (sheetName.equals(title)) {
-                sheetId = sheet.path("properties").path("sheetId").asInt();
-                targetSheet = sheet;
-                break;
-            }
-        }
-        if (sheetId == null || targetSheet == null) {
-            return;
-        }
-
-        List<Map<String, Object>> requests = new ArrayList<>();
+    private static void appendTablePresentationRequests(
+        JsonNode targetSheet,
+        int sheetId,
+        int rowCount,
+        List<Map<String, Object>> requests
+    ) {
         int dataRowEnd = Math.max(2, rowCount);
 
         JsonNode bandedRanges = targetSheet.get("bandedRanges");
@@ -1219,18 +1293,8 @@ public final class GoogleSheetsSyncService {
         requests.add(columnWidthRequest(sheetId, 7, 180));
         requests.add(columnWidthRequest(sheetId, 8, 180));
         requests.add(columnWidthRequest(sheetId, 9, 180));
-        requests.add(columnWidthRequest(sheetId, 10, 420));
-
-        String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + ":batchUpdate";
-        String payload = OBJECT_MAPPER.writeValueAsString(Map.of("requests", requests));
-        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-            .header("Authorization", "Bearer " + accessToken)
-            .header("Content-Type", "application/json; charset=UTF-8")
-            .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
-            .build();
-
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        ensureOk(response, "apply sheet table presentation");
+        requests.add(columnWidthRequest(sheetId, REMAINING_COLUMN_INDEX, REMAINING_COLUMN_WIDTH_PX));
+        requests.add(columnWidthRequest(sheetId, FOLDER_LINK_COLUMN_INDEX, FOLDER_LINK_COLUMN_WIDTH_PX));
     }
 
     private static Map<String, Object> columnWidthRequest(int sheetId, int columnIndex, int pixelSize) {
@@ -1248,35 +1312,12 @@ public final class GoogleSheetsSyncService {
         );
     }
 
-    private static void upsertStatusConditionalFormatRules(String spreadsheetId, String sheetName, String accessToken)
-        throws Exception {
-        JsonNode root = readSpreadsheetMetadata(
-            spreadsheetId,
-            "sheets(properties(sheetId,title),conditionalFormats)",
-            accessToken
-        );
-
-        JsonNode sheets = root == null ? null : root.get("sheets");
-        if (sheets == null || !sheets.isArray()) {
-            return;
-        }
-
-        Integer sheetId = null;
-        JsonNode targetSheet = null;
-        for (JsonNode sheet : sheets) {
-            String title = sheet.path("properties").path("title").asText("").trim();
-            if (sheetName.equals(title)) {
-                sheetId = sheet.path("properties").path("sheetId").asInt();
-                targetSheet = sheet;
-                break;
-            }
-        }
-        if (sheetId == null || targetSheet == null) {
-            return;
-        }
-
+    private static void appendStatusConditionalFormatRequests(
+        JsonNode targetSheet,
+        int sheetId,
+        List<Map<String, Object>> requests
+    ) {
         List<Integer> existingRuleIndexes = findStatusRuleIndexes(targetSheet);
-        List<Map<String, Object>> requests = new ArrayList<>();
 
         for (int i = existingRuleIndexes.size() - 1; i >= 0; i--) {
             int ruleIndex = existingRuleIndexes.get(i);
@@ -1297,22 +1338,6 @@ public final class GoogleSheetsSyncService {
                 )
             ));
         }
-
-        if (requests.isEmpty()) {
-            return;
-        }
-
-        String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + ":batchUpdate";
-        String payload = OBJECT_MAPPER.writeValueAsString(Map.of("requests", requests));
-
-        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-            .header("Authorization", "Bearer " + accessToken)
-            .header("Content-Type", "application/json; charset=UTF-8")
-            .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
-            .build();
-
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        ensureOk(response, "apply status conditional formatting");
     }
 
     private static List<Integer> findStatusRuleIndexes(JsonNode sheetNode) {
@@ -1347,35 +1372,12 @@ public final class GoogleSheetsSyncService {
         return false;
     }
 
-    private static void upsertRemainingConditionalFormatRule(String spreadsheetId, String sheetName, String accessToken)
-        throws Exception {
-        JsonNode root = readSpreadsheetMetadata(
-            spreadsheetId,
-            "sheets(properties(sheetId,title),conditionalFormats)",
-            accessToken
-        );
-
-        JsonNode sheets = root == null ? null : root.get("sheets");
-        if (sheets == null || !sheets.isArray()) {
-            return;
-        }
-
-        Integer sheetId = null;
-        JsonNode targetSheet = null;
-        for (JsonNode sheet : sheets) {
-            String title = sheet.path("properties").path("title").asText("").trim();
-            if (sheetName.equals(title)) {
-                sheetId = sheet.path("properties").path("sheetId").asInt();
-                targetSheet = sheet;
-                break;
-            }
-        }
-        if (sheetId == null || targetSheet == null) {
-            return;
-        }
-
+    private static void appendRemainingConditionalFormatRequests(
+        JsonNode targetSheet,
+        int sheetId,
+        List<Map<String, Object>> requests
+    ) {
         List<Integer> existingRuleIndexes = findRuleIndexesByColumn(targetSheet, REMAINING_COLUMN_INDEX);
-        List<Map<String, Object>> requests = new ArrayList<>();
 
         for (int i = existingRuleIndexes.size() - 1; i >= 0; i--) {
             int ruleIndex = existingRuleIndexes.get(i);
@@ -1396,18 +1398,6 @@ public final class GoogleSheetsSyncService {
                 )
             ));
         }
-
-        String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + ":batchUpdate";
-        String payload = OBJECT_MAPPER.writeValueAsString(Map.of("requests", requests));
-
-        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-            .header("Authorization", "Bearer " + accessToken)
-            .header("Content-Type", "application/json; charset=UTF-8")
-            .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
-            .build();
-
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        ensureOk(response, "apply remaining-time conditional formatting");
     }
 
     private static List<Integer> findRuleIndexesByColumn(JsonNode sheetNode, int columnIndex) {
@@ -1478,6 +1468,82 @@ public final class GoogleSheetsSyncService {
         return rules;
     }
 
+    private static void appendStatusCellFormatRequests(
+        int sheetId,
+        List<BidSheetRow> sortedRows,
+        List<Map<String, Object>> requests
+    ) {
+        if (sortedRows == null || sortedRows.isEmpty()) {
+            return;
+        }
+
+        BidStatus activeStatus = null;
+        int activeStartRow = -1;
+        for (int i = 0; i < sortedRows.size(); i++) {
+            BidStatus status = sortedRows.get(i) == null ? null : sortedRows.get(i).status();
+            if (status == activeStatus) {
+                continue;
+            }
+            appendStatusCellFormatRequest(sheetId, activeStatus, activeStartRow, i + 1, requests);
+            activeStatus = status;
+            activeStartRow = i + 1;
+        }
+        appendStatusCellFormatRequest(sheetId, activeStatus, activeStartRow, sortedRows.size() + 1, requests);
+    }
+
+    private static void appendStatusCellFormatRequest(
+        int sheetId,
+        BidStatus status,
+        int startRowIndex,
+        int endRowIndex,
+        List<Map<String, Object>> requests
+    ) {
+        if (status == null || startRowIndex < 1 || endRowIndex <= startRowIndex) {
+            return;
+        }
+        Map<String, Object> format = statusCellFormat(status);
+        if (format == null || format.isEmpty()) {
+            return;
+        }
+        requests.add(Map.of(
+            "repeatCell", Map.of(
+                "range", Map.of(
+                    "sheetId", sheetId,
+                    "startRowIndex", startRowIndex,
+                    "endRowIndex", endRowIndex,
+                    "startColumnIndex", STATUS_COLUMN_INDEX,
+                    "endColumnIndex", STATUS_COLUMN_INDEX + 1
+                ),
+                "cell", Map.of("userEnteredFormat", format),
+                "fields", "userEnteredFormat(backgroundColor,textFormat)"
+            )
+        ));
+    }
+
+    private static Map<String, Object> statusCellFormat(BidStatus status) {
+        return switch (status) {
+            case TBMT_CANCELLED -> statusCellFormat(color(0.85, 0.85, 0.85), color(0.30, 0.30, 0.30));
+            case INVITATION_OPEN -> statusCellFormat(color(0.97, 0.84, 0.85), null);
+            case BIDDING_CLOSED -> statusCellFormat(color(0.72, 0.11, 0.11), color(1.00, 1.00, 1.00));
+            case BID_OPENED -> statusCellFormat(color(0.85, 0.95, 0.85), null);
+            case CONTRACTOR_SELECTION_RESULT_AVAILABLE -> statusCellFormat(color(0.09, 0.60, 0.24), color(1.00, 1.00, 1.00));
+            case CONTRACT_INFORMATION_AVAILABLE -> statusCellFormat(color(0.11, 0.37, 0.13), color(1.00, 1.00, 1.00));
+        };
+    }
+
+    private static Map<String, Object> statusCellFormat(
+        Map<String, Object> backgroundColor,
+        Map<String, Object> textColor
+    ) {
+        if (textColor == null) {
+            return Map.of("backgroundColor", backgroundColor);
+        }
+        return Map.of(
+            "backgroundColor", backgroundColor,
+            "textFormat", Map.of("foregroundColor", textColor)
+        );
+    }
+
     private static Map<String, Object> buildStatusRule(
         int sheetId,
         String statusText,
@@ -1532,9 +1598,7 @@ public final class GoogleSheetsSyncService {
             .header("Content-Type", "application/json; charset=UTF-8")
             .POST(HttpRequest.BodyPublishers.ofString("{}", StandardCharsets.UTF_8))
             .build();
-
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        ensureOk(response, "clear data range " + rangeA1);
+        sendWriteWithRetry(request, "clear data range " + rangeA1);
     }
 
     private static void updateDataRange(String spreadsheetId, String sheetName, List<BidSheetRow> rows, String accessToken)
@@ -1568,8 +1632,7 @@ public final class GoogleSheetsSyncService {
             .PUT(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
             .build();
 
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        ensureOk(response, "update range " + rangeA1);
+        sendWriteWithRetry(request, "update range " + rangeA1);
     }
 
     private static String urlEncode(String value) {
@@ -1739,5 +1802,93 @@ public final class GoogleSheetsSyncService {
         long hours = (totalMinutes % (24 * 60)) / 60;
         long minutes = totalMinutes % 60;
         return days + " ngày " + hours + " giờ " + minutes + " phút";
+    }
+
+    /**
+     * One spreadsheets.get per sync (plus reload after addSheet) to stay under read-requests/minute quota.
+     */
+    private static final class SpreadsheetMetadataCache {
+        private static final String METADATA_FIELDS =
+            "sheets(properties(sheetId,title),bandedRanges(bandedRangeId,range),conditionalFormats)";
+
+        private final String spreadsheetId;
+        private final String accessToken;
+        private JsonNode root;
+
+        SpreadsheetMetadataCache(String spreadsheetId, String accessToken) throws Exception {
+            this.spreadsheetId = spreadsheetId;
+            this.accessToken = accessToken;
+            reload();
+        }
+
+        String spreadsheetId() {
+            return spreadsheetId;
+        }
+
+        String accessToken() {
+            return accessToken;
+        }
+
+        void reload() throws Exception {
+            root = readSpreadsheetMetadata(spreadsheetId, METADATA_FIELDS, accessToken);
+        }
+
+        boolean sheetExists(String sheetName) {
+            return sheetNode(sheetName) != null;
+        }
+
+        Integer resolveSheetId(String sheetName) {
+            JsonNode sheet = sheetNode(sheetName);
+            if (sheet == null) {
+                return null;
+            }
+            return sheet.path("properties").path("sheetId").asInt();
+        }
+
+        JsonNode sheetNode(String sheetName) {
+            if (sheetName == null) {
+                return null;
+            }
+            JsonNode sheets = root == null ? null : root.get("sheets");
+            if (sheets == null || !sheets.isArray()) {
+                return null;
+            }
+            for (JsonNode sheet : sheets) {
+                String title = sheet.path("properties").path("title").asText("").trim();
+                if (sheetName.equals(title)) {
+                    return sheet;
+                }
+            }
+            return null;
+        }
+
+        void ensureSheetExists(String sheetName) throws Exception {
+            if (sheetExists(sheetName)) {
+                return;
+            }
+            String url = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId + ":batchUpdate";
+            String payload = OBJECT_MAPPER.writeValueAsString(Map.of(
+                "requests", List.of(
+                    Map.of(
+                        "addSheet", Map.of(
+                            "properties", Map.of("title", sheetName)
+                        )
+                    )
+                )
+            ));
+
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                .header("Authorization", "Bearer " + accessToken)
+                .header("Content-Type", "application/json; charset=UTF-8")
+                .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
+                .build();
+
+            HttpResponse<String> response = HTTP_CLIENT.send(
+                request,
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            ensureOk(response, "create sheet " + sheetName);
+            reload();
+        }
     }
 }

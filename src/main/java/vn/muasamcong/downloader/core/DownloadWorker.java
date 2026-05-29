@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.function.BooleanSupplier;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -178,6 +179,7 @@ public final class DownloadWorker implements Runnable {
     private final Map<String, DownloadHints> downloadHintsByTargetKey;
     private final Map<String, String> detailUrlByTargetKey;
     private final boolean persistRunState;
+    private final BooleanSupplier awaitMoreTargets;
 
     public DownloadWorker(
         Queue<KeywordTarget> keywordQueue,
@@ -200,7 +202,8 @@ public final class DownloadWorker implements Runnable {
             workerSlot,
             downloadHintsByTargetKey,
             detailUrlByTargetKey,
-            true
+            true,
+            null
         );
     }
 
@@ -216,6 +219,34 @@ public final class DownloadWorker implements Runnable {
         Map<String, String> detailUrlByTargetKey,
         boolean persistRunState
     ) {
+        this(
+            keywordQueue,
+            baseUrl,
+            baseDownloadDir,
+            maxRetries,
+            stats,
+            stopRequested,
+            workerSlot,
+            downloadHintsByTargetKey,
+            detailUrlByTargetKey,
+            persistRunState,
+            null
+        );
+    }
+
+    public DownloadWorker(
+        Queue<KeywordTarget> keywordQueue,
+        String baseUrl,
+        Path baseDownloadDir,
+        int maxRetries,
+        RunStats stats,
+        AtomicBoolean stopRequested,
+        int workerSlot,
+        Map<String, DownloadHints> downloadHintsByTargetKey,
+        Map<String, String> detailUrlByTargetKey,
+        boolean persistRunState,
+        BooleanSupplier awaitMoreTargets
+    ) {
         this.keywordQueue = keywordQueue;
         this.baseUrl = baseUrl;
         this.baseDownloadDir = baseDownloadDir;
@@ -226,6 +257,7 @@ public final class DownloadWorker implements Runnable {
         this.downloadHintsByTargetKey = downloadHintsByTargetKey == null ? Map.of() : downloadHintsByTargetKey;
         this.detailUrlByTargetKey = detailUrlByTargetKey == null ? Map.of() : detailUrlByTargetKey;
         this.persistRunState = persistRunState;
+        this.awaitMoreTargets = awaitMoreTargets;
     }
 
     public static void prepareBidInfoOutput() {
@@ -422,7 +454,13 @@ public final class DownloadWorker implements Runnable {
                 }
 
                 KeywordTarget target = keywordQueue.poll();
-                if (target == null) break;
+                if (target == null) {
+                    if (awaitMoreTargets != null && awaitMoreTargets.getAsBoolean()) {
+                        Thread.sleep(400);
+                        continue;
+                    }
+                    break;
+                }
 
                 activeTarget = target;
 
@@ -432,7 +470,11 @@ public final class DownloadWorker implements Runnable {
                 int downloadedFilesCount = 0;
                 String lastErrorMessage = "Unknown error";
                 Utils.logStatus(keyword, "START", 0,
-                    "Begin processing keyword.");
+                    "worker=" + workerSlot
+                        + " | folder=" + (target.folderPath() == null
+                        ? "-"
+                        : target.folderPath().toAbsolutePath().normalize())
+                        + " | Begin processing keyword.");
 
                 for (int attempt = 1; attempt <= maxAttempts; attempt++) {
                     if (shouldStop()) {
@@ -624,7 +666,7 @@ public final class DownloadWorker implements Runnable {
         } else if (!hints.needBbmtPdf()) {
             Utils.logStatus(keyword, "INFO", 0, "API hints: BBMT not required. Skipping.");
         } else {
-            Utils.logStatus(keyword, "INFO", 0, "Tab 'Biên bản mở thầu' not present. Skipping.");
+            Utils.logStatus(keyword, "INFO", 0, "BBMT tab not present. Skipping.");
         }
 
         // ── Step 3: Tab "Kết quả lựa chọn nhà thầu" (tuỳ chọn) ─────────────

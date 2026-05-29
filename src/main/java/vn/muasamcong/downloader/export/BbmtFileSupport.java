@@ -5,6 +5,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.text.Normalizer;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.stream.Stream;
 
 public final class BbmtFileSupport {
@@ -26,14 +27,19 @@ public final class BbmtFileSupport {
      * leaves {@code _Biên bản mở thầu.pdf} next to other artifacts).
      */
     public static boolean isPresentForPackage(Path packageFolder, String notifyNo) {
+        return findPresentForPackage(packageFolder, notifyNo).isPresent();
+    }
+
+    public static Optional<Path> findPresentForPackage(Path packageFolder, String notifyNo) {
         if (packageFolder == null || !Files.isDirectory(packageFolder)) {
-            return false;
+            return Optional.empty();
         }
         Path autoDownload = packageFolder.resolve("auto-download");
-        if (isPresentOnDisk(autoDownload, notifyNo)) {
-            return true;
+        Optional<Path> autoDownloadFile = findPresentOnDisk(autoDownload, notifyNo);
+        if (autoDownloadFile.isPresent()) {
+            return autoDownloadFile;
         }
-        return scanDir(packageFolder, notifyNo, false);
+        return scanDir(packageFolder, notifyNo);
     }
 
     public static boolean isPresentOnDisk(Path autoDownloadDir) {
@@ -42,19 +48,21 @@ public final class BbmtFileSupport {
 
     /** True when a BBMT-like PDF exists, or any PDF whose name contains {@code notifyNo}. */
     public static boolean isPresentOnDisk(Path autoDownloadDir, String notifyNo) {
-        if (autoDownloadDir == null || !Files.isDirectory(autoDownloadDir)) {
-            return false;
-        }
-        return scanDir(autoDownloadDir, notifyNo, true);
+        return findPresentOnDisk(autoDownloadDir, notifyNo).isPresent();
     }
 
-    private static boolean scanDir(Path dir, String notifyNo, boolean allowGenericNotifyPdf) {
-        String notifyToken = normalizeNotifyToken(notifyNo);
+    public static Optional<Path> findPresentOnDisk(Path autoDownloadDir, String notifyNo) {
+        if (autoDownloadDir == null || !Files.isDirectory(autoDownloadDir)) {
+            return Optional.empty();
+        }
+        return scanDir(autoDownloadDir, notifyNo);
+    }
+
+    private static Optional<Path> scanDir(Path dir, String notifyNo) {
         try (Stream<Path> files = Files.list(dir)) {
-            return files.anyMatch(path -> looksLikeBbmtFileName(path, notifyNo)
-                || (allowGenericNotifyPdf && matchesGenericBbmtNotifyPdf(path, notifyToken)));
+            return files.filter(path -> looksLikeBbmtFileName(path, notifyNo)).findFirst();
         } catch (IOException ex) {
-            return false;
+            return Optional.empty();
         }
     }
 
@@ -124,12 +132,9 @@ public final class BbmtFileSupport {
         }
         String folded = foldForMatch(lower);
         return lower.contains("bbmt")
-            || lower.contains("bien ban")
-            || lower.contains("biên bản")
-            || lower.contains("mo thau")
-            || lower.contains("mở thầu")
+            || folded.contains("bbmt")
             || folded.contains("bien ban mo thau")
-            || folded.contains("bbmt");
+            || (folded.contains("bien ban") && folded.contains("mo thau"));
     }
 
     private static String foldForMatch(String text) {

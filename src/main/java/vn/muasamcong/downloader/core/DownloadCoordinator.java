@@ -59,6 +59,7 @@ public final class DownloadCoordinator {
 
         int normalizedConcurrency = Math.max(DEFAULT_CONCURRENCY, Math.min(MAX_CONCURRENCY, concurrency));
         Path tempDownloadDir = DEFAULT_DOWNLOAD_DIR;
+        ensureChromeProfiles(normalizedConcurrency);
         SeleniumHelper.quitAllDriversNow();
         Utils.logPlain("Pre-flight cleanup done: closed leftover Chrome/ChromeDriver sessions.");
         Utils.ensureDirectory(tempDownloadDir);
@@ -153,12 +154,19 @@ public final class DownloadCoordinator {
 
         int normalizedConcurrency = Math.max(DEFAULT_CONCURRENCY, Math.min(MAX_CONCURRENCY, concurrency));
         Path tempDownloadDir = DEFAULT_DOWNLOAD_DIR;
+        ensureChromeProfiles(normalizedConcurrency);
         SeleniumHelper.quitAllDriversNow();
         Utils.logPlain("Monitor download pre-flight: closed leftover Chrome/ChromeDriver sessions.");
         Utils.ensureDirectory(tempDownloadDir);
         DownloadWorker.prepareBidInfoOutput();
 
         Utils.logPlain("Monitor download targets: " + targets.size());
+        for (KeywordTarget target : targets) {
+            if (target != null && target.keyword() != null && target.folderPath() != null) {
+                Utils.logPlain("Loaded keyword: " + target.keyword()
+                    + " folder=" + target.folderPath().toAbsolutePath());
+            }
+        }
         Utils.logPlain("Temp download folder: " + tempDownloadDir.toAbsolutePath());
         Utils.logPlain("Concurrent browsers: " + normalizedConcurrency);
 
@@ -236,5 +244,18 @@ public final class DownloadCoordinator {
             poolRef.shutdownNow();
         }
         SeleniumHelper.quitAllDriversNow();
+    }
+
+    public static void ensureChromeProfilesForParallel(int concurrency) {
+        ensureChromeProfiles(concurrency);
+    }
+
+    private static void ensureChromeProfiles(int concurrency) {
+        int safeConcurrency = Math.max(DEFAULT_CONCURRENCY, Math.min(MAX_CONCURRENCY, concurrency));
+        Path base = Utils.dataDirectory().resolve("chrome-profiles").toAbsolutePath().normalize();
+        Utils.ensureDirectory(base);
+        for (int i = 1; i <= safeConcurrency; i++) {
+            Utils.ensureDirectory(base.resolve("profile-" + i));
+        }
     }
 }

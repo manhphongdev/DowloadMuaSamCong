@@ -148,6 +148,8 @@ public final class MonitorParallelBbmtRunner {
         stopRequested.set(true);
         apiSyncComplete.set(true);
         pool.shutdownNow();
+        SeleniumHelper.quitAllDriversNow();
+        ACTIVE.compareAndSet(this, null);
     }
 
     public RunStats awaitCompletion() throws InterruptedException {

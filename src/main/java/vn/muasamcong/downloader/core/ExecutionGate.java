@@ -9,6 +9,7 @@ public final class ExecutionGate {
 
     private static final AtomicInteger monitorHolds = new AtomicInteger();
     private static final AtomicInteger downloadHolds = new AtomicInteger();
+    private static volatile boolean allowDownloadDuringMonitor;
 
     private ExecutionGate() {
     }
@@ -25,8 +26,12 @@ public final class ExecutionGate {
         monitorHolds.updateAndGet(value -> Math.max(0, value - 1));
     }
 
+    public static void setAllowDownloadDuringMonitor(boolean allowed) {
+        allowDownloadDuringMonitor = allowed;
+    }
+
     public static boolean tryBeginDownload() {
-        if (isMonitorBusy()) {
+        if (isMonitorBusy() && !allowDownloadDuringMonitor) {
             return false;
         }
         downloadHolds.incrementAndGet();

@@ -7,13 +7,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
-import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -21,12 +19,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.IdentityHashMap;
 import java.util.Optional;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javafx.animation.PauseTransition;
 import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.SimpleBooleanProperty;
 import javafx.beans.value.ChangeListener;
@@ -79,20 +75,21 @@ import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
 import javafx.scene.control.ScrollPane;
 import javafx.scene.control.SplitPane;
+import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import javafx.stage.FileChooser;
 import javafx.stage.Modality;
 import javafx.stage.Stage;
-import vn.muasamcong.downloader.application.monitor.MonitorCycleResult;
+import javafx.util.Duration;
 import vn.muasamcong.downloader.application.monitor.MonitorScheduler;
 import vn.muasamcong.downloader.core.AppFeatures;
+import vn.muasamcong.downloader.export.EgpAgentFileDownloadService;
 import vn.muasamcong.downloader.core.DownloadCoordinator;
 import vn.muasamcong.downloader.core.ExecutionGate;
 import vn.muasamcong.downloader.core.RunStats;
 import vn.muasamcong.downloader.domain.monitor.MonitorSettings;
 import vn.muasamcong.downloader.export.BidSheetApiSyncService;
 import vn.muasamcong.downloader.export.GoogleSheetsSyncService;
-import vn.muasamcong.downloader.store.AutoRunConfigStore;
 import vn.muasamcong.downloader.store.ArtifactFingerprintStore;
 import vn.muasamcong.downloader.store.BidTrackingRecordStore;
 import vn.muasamcong.downloader.store.BrowserProfileConfigStore;
@@ -114,17 +111,16 @@ public final class DownloaderFxApp extends Application {
     );
     private static final Pattern LOADED_KEYWORD_PATTERN = Pattern.compile("^Loaded keyword:\\s+(\\S+)\\s+folder=(.*)$");
     private static final Pattern DOWNLOADED_FILES_PATTERN = Pattern.compile("Downloaded files:\\s*(\\d+)\\s*/\\s*(\\d+)");
+    private static final Pattern FOLDER_IN_MESSAGE_PATTERN = Pattern.compile("\\bfolder=([^|]+)");
+    private static final Pattern AGENT_FILE_FIELD_PATTERN = Pattern.compile("\\b(file|fileId|folder)=([^|]+)");
     private static final Path BID_ROWS_JSON_FILE = Utils.dataFile("bid_sheet_rows.json").toAbsolutePath().normalize();
-    private static final DateTimeFormatter NEXT_RUN_FORMAT = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
     private static final DateTimeFormatter LOG_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter PROGRESS_TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     private Stage ownerStage;
+    private Stage detailProgressStage;
     private ListView<FolderItem> folderListView;
     private TextField reportField;
-    private Spinner<Integer> concurrencySpinner;
-    private Button startButton;
-    private Button stopButton;
     private Button addFolderButton;
     private Button deleteFolderButton;
     private Button checkAllFoldersButton;
@@ -142,22 +138,15 @@ public final class DownloaderFxApp extends Application {
     private Button openUpdateFolderButton;
     private Button saveBrowserProfileButton;
     private CheckBox autoCheckUpdateOnStartupCheckBox;
-    private CheckBox autoRunCheckBox;
     private ComboBox<String> browserProfileComboBox;
-    private Spinner<Integer> autoRunIntervalSpinner;
-    private TextField autoRunStartTimeField;
-    private TextField autoRunStopTimeField;
-    private final List<CheckBox> autoRunDayChecks = new ArrayList<>();
-    private Button autoRunSaveButton;
-    private Label autoRunInfoLabel;
-    private CheckBox monitorEnabledCheckBox;
-    private CheckBox monitorDownloadAfterSheetCheckBox;
+    private Button monitorStopButton;
     private Spinner<Integer> monitorIntervalSpinner;
+    private Spinner<Integer> agentDownloadConcurrencySpinner;
+    private Spinner<Integer> seleniumDownloadConcurrencySpinner;
+    private CheckBox bbmtSeleniumDownloadCheckBox;
+    private Button monitorRunNowButton;
     private Button monitorSaveButton;
-    private Button monitorRunOnceButton;
-    private Label monitorInfoLabel;
     private MonitorScheduler monitorScheduler;
-    private Task<MonitorCycleResult> activeMonitorTask;
     private Label selectedFoldersLabel;
     private Label currentVersionLabel;
     private Label latestVersionLabel;
@@ -168,10 +157,24 @@ public final class DownloaderFxApp extends Application {
     private TextArea updateNotesArea;
     private TableView<KeywordProgressRow> progressTableView;
     private TableView<KeywordProgressRow> detailProgressTableView;
+    private TableView<AgentFileProgressRow> agentFileTableView;
+    private TableView<AgentFileProgressRow> detailAgentFileTableView;
     private Label statusLabel;
     private Label loadedLabel;
+    private Label runningLabel;
+    private Label downloadedFilesLabel;
     private Label successLabel;
     private Label failedLabel;
+    private Label currentActivityLabel;
+    private Label agentFileTitleLabel;
+    private Label agentFileFolderLabel;
+    private Label detailAgentFileTitleLabel;
+    private Label detailAgentFileFolderLabel;
+    private Label detailProgressZoomLabel;
+    private VBox detailProgressRoot;
+    private Label toastLabel;
+    private StackPane toastLayer;
+    private PauseTransition toastHideDelay;
     private ProgressIndicator progressIndicator;
 
     private final List<String> fullLogs = new ArrayList<>();
@@ -179,6 +182,8 @@ public final class DownloaderFxApp extends Application {
     private final Set<String> failedKeywordSet = new LinkedHashSet<>();
     private final ObservableList<FolderItem> folderItems = FXCollections.observableArrayList();
     private final ObservableList<KeywordProgressRow> progressRows = FXCollections.observableArrayList();
+    private final ObservableList<AgentFileProgressRow> agentFileRows = FXCollections.observableArrayList();
+    private final ObservableList<AgentFileProgressRow> detailAgentFileRows = FXCollections.observableArrayList();
     private final List<String> keywordOrder = new ArrayList<>();
     private final Map<String, Integer> keywordIndexState = new LinkedHashMap<>();
     private final Map<String, String> keywordFolderState = new LinkedHashMap<>();
@@ -187,6 +192,11 @@ public final class DownloaderFxApp extends Application {
     private final Map<String, String> keywordMessageState = new LinkedHashMap<>();
     private final Map<String, String> keywordStartTimeState = new LinkedHashMap<>();
     private final Map<String, String> keywordEndTimeState = new LinkedHashMap<>();
+    private final Map<String, LinkedHashMap<String, AgentFileProgressState>> keywordAgentFilesState = new LinkedHashMap<>();
+    private String currentActivityText = "Idle";
+    private String selectedAgentKeyword;
+    private String currentAgentKeyword;
+    private int progressZoomPercent = 125;
     private int loadedKeywords;
     private int successCount;
     private int failCount;
@@ -194,15 +204,8 @@ public final class DownloaderFxApp extends Application {
     private Task<RunStats> activeDownloadTask;
     private String currentReportLink;
     private volatile boolean stopRequestedByUser;
-    private volatile boolean stopRequestedByScheduler;
-    private volatile boolean autoRestartAfterStop;
-    private volatile boolean activeRunAutoTriggered;
-    private volatile LocalDateTime lastAutoNoPendingAlertAt;
-    private volatile boolean autoNoPendingAlertShowing;
-    private volatile LocalDateTime nextAutoRunAt;
     private UpdateInfo latestUpdateInfo;
     private Path downloadedUpdatePath;
-    private ScheduledExecutorService autoRunScheduler;
     private final AtomicBoolean folderChooserOpening = new AtomicBoolean(false);
     private final Map<FolderItem, ChangeListener<Boolean>> folderSelectionListeners = new IdentityHashMap<>();
     private SystemTraySupport systemTraySupport;
@@ -260,64 +263,11 @@ public final class DownloaderFxApp extends Application {
         uncheckAllFoldersButton.getStyleClass().add("secondary-button");
         uncheckAllFoldersButton.setOnAction(event -> handleCheckAllFolders(false));
 
-        autoRunCheckBox = new CheckBox("Enable auto run");
-        autoRunIntervalSpinner = new Spinner<>(1, 1440, 30, 1);
-        autoRunIntervalSpinner.setEditable(true);
-        autoRunIntervalSpinner.setPrefWidth(115);
-        autoRunIntervalSpinner.setMinWidth(115);
-        autoRunIntervalSpinner.setMaxWidth(115);
-
-        autoRunStartTimeField = new TextField("08:00");
-        autoRunStartTimeField.setPromptText("HH:mm");
-        autoRunStartTimeField.setPrefWidth(115);
-        autoRunStartTimeField.setMinWidth(115);
-        autoRunStartTimeField.setMaxWidth(115);
-        autoRunStartTimeField.textProperty().addListener((obs, oldVal, newVal) -> updateAutoRunTimeValidation());
-
-        autoRunStopTimeField = new TextField("18:00");
-        autoRunStopTimeField.setPromptText("HH:mm");
-        autoRunStopTimeField.setPrefWidth(115);
-        autoRunStopTimeField.setMinWidth(115);
-        autoRunStopTimeField.setMaxWidth(115);
-        autoRunStopTimeField.textProperty().addListener((obs, oldVal, newVal) -> updateAutoRunTimeValidation());
-
-        autoRunDayChecks.clear();
-        autoRunDayChecks.add(new CheckBox("Mon"));
-        autoRunDayChecks.add(new CheckBox("Tue"));
-        autoRunDayChecks.add(new CheckBox("Wed"));
-        autoRunDayChecks.add(new CheckBox("Thu"));
-        autoRunDayChecks.add(new CheckBox("Fri"));
-        autoRunDayChecks.add(new CheckBox("Sat"));
-        autoRunDayChecks.add(new CheckBox("Sun"));
-        autoRunDayChecks.forEach(cb -> cb.setSelected(true));
-
-        autoRunSaveButton = new Button("Save schedule");
-        autoRunSaveButton.getStyleClass().add("outline-primary-button");
-        autoRunSaveButton.setPrefWidth(126);
-        autoRunSaveButton.setMinWidth(126);
-        autoRunSaveButton.setOnAction(event -> handleSaveAutoRunConfig());
-
-        autoRunInfoLabel = new Label("Auto run is OFF");
-        autoRunInfoLabel.getStyleClass().add("field-hint");
-
         loadSavedFolders();
-        loadAutoRunConfig();
 
         reportField = new TextField();
         reportField.setPromptText("Google Sheets link will appear here...");
         reportField.setEditable(false);
-
-        concurrencySpinner = new Spinner<>(1, 10, 2);
-        concurrencySpinner.setEditable(true);
-        concurrencySpinner.setPrefWidth(130);
-
-        startButton = new Button("RUN");
-        startButton.getStyleClass().add("primary-button");
-
-        stopButton = new Button("STOP");
-        stopButton.getStyleClass().add("danger-button");
-        stopButton.setDisable(true);
-        stopButton.setOnAction(event -> handleStopAction());
 
         openReportButton = new Button("Open");
         openReportButton.getStyleClass().add("secondary-button");
@@ -404,6 +354,8 @@ public final class DownloaderFxApp extends Application {
 
         expandProgressButton = new Button("⤢");
         expandProgressButton.getStyleClass().add("icon-button");
+        expandProgressButton.setText("Zoom");
+        expandProgressButton.setTooltip(new Tooltip("Zoom progress"));
         expandProgressButton.setOnAction(event -> showProgressFullscreen());
 
         statusLabel = new Label("Ready");
@@ -411,10 +363,26 @@ public final class DownloaderFxApp extends Application {
 
         loadedLabel = new Label();
         loadedLabel.getStyleClass().addAll("badge", "badge-blue");
+        runningLabel = new Label();
+        runningLabel.getStyleClass().addAll("badge", "badge-amber");
+        downloadedFilesLabel = new Label();
+        downloadedFilesLabel.getStyleClass().addAll("badge", "badge-purple");
         successLabel = new Label();
         successLabel.getStyleClass().addAll("badge", "badge-green");
         failedLabel = new Label();
         failedLabel.getStyleClass().addAll("badge", "badge-red");
+        currentActivityLabel = new Label("Now: Idle");
+        currentActivityLabel.getStyleClass().add("activity-label");
+        currentActivityLabel.setWrapText(true);
+
+        toastLabel = new Label();
+        toastLabel.getStyleClass().add("toast-notification");
+        toastLabel.setVisible(false);
+        toastLabel.setManaged(false);
+        toastLayer = new StackPane(toastLabel);
+        toastLayer.setMouseTransparent(true);
+        StackPane.setAlignment(toastLabel, Pos.TOP_RIGHT);
+        StackPane.setMargin(toastLabel, new Insets(18));
 
         progressIndicator = new ProgressIndicator();
         progressIndicator.setVisible(false);
@@ -423,28 +391,53 @@ public final class DownloaderFxApp extends Application {
 
         progressTableView = createProgressTable(false);
         VBox.setVgrow(progressTableView, Priority.ALWAYS);
+        progressTableView.getSelectionModel().selectedItemProperty().addListener((obs, oldRow, newRow) -> {
+            selectedAgentKeyword = newRow == null ? null : newRow.keyword();
+            if (selectedAgentKeyword != null && !selectedAgentKeyword.isBlank()) {
+                selectKeywordInTable(detailProgressTableView, selectedAgentKeyword);
+            }
+            refreshAgentFileDetail();
+            refreshDetailAgentFileDetail();
+        });
+        agentFileTableView = createAgentFileTable(agentFileRows);
         resetProgressCounters();
         refreshProgressView();
         updateReportFromConfig();
-        updateAutoRunInfoLabel();
-        refreshAutoRunModeUi();
-        updateAutoRunTimeValidation();
 
-        monitorEnabledCheckBox = new CheckBox("Enable monitor (API + sheet)");
-        monitorDownloadAfterSheetCheckBox = new CheckBox("Tải file Selenium sau khi cập nhật sheet");
         monitorIntervalSpinner = new Spinner<>(5, 1440, 30, 1);
         monitorIntervalSpinner.setEditable(true);
         monitorIntervalSpinner.setPrefWidth(115);
+        agentDownloadConcurrencySpinner = new Spinner<>(
+            AppFeatures.AGENT_DOWNLOAD_MAX_CONCURRENCY_MIN,
+            AppFeatures.AGENT_DOWNLOAD_MAX_CONCURRENCY_MAX,
+            AppFeatures.AGENT_DOWNLOAD_MAX_CONCURRENCY_DEFAULT,
+            1
+        );
+        agentDownloadConcurrencySpinner.setEditable(true);
+        agentDownloadConcurrencySpinner.setPrefWidth(80);
+        seleniumDownloadConcurrencySpinner = new Spinner<>(
+            AppFeatures.SELENIUM_DOWNLOAD_MAX_CONCURRENCY_MIN,
+            AppFeatures.SELENIUM_DOWNLOAD_MAX_CONCURRENCY_MAX,
+            AppFeatures.SELENIUM_DOWNLOAD_MAX_CONCURRENCY_DEFAULT,
+            1
+        );
+        seleniumDownloadConcurrencySpinner.setEditable(true);
+        seleniumDownloadConcurrencySpinner.setPrefWidth(80);
+        bbmtSeleniumDownloadCheckBox = new CheckBox("Tải BBMT bằng trình duyệt (Selenium)");
+        bbmtSeleniumDownloadCheckBox.setSelected(true);
+        bbmtSeleniumDownloadCheckBox.setDisable(!AppFeatures.isMonitorBbmtSeleniumEnabled());
+        monitorRunNowButton = new Button("Run now");
+        monitorRunNowButton.getStyleClass().add("primary-button");
+        monitorRunNowButton.setOnAction(event -> startMonitorNow());
         monitorSaveButton = new Button("Save monitor");
         monitorSaveButton.getStyleClass().add("outline-primary-button");
         monitorSaveButton.setOnAction(event -> saveMonitorSettings());
-        monitorRunOnceButton = new Button("Run monitor once");
-        monitorRunOnceButton.getStyleClass().add("outline-primary-button");
-        monitorRunOnceButton.setOnAction(event -> startMonitorOnce());
-        monitorInfoLabel = new Label();
-        monitorInfoLabel.getStyleClass().add("autorun-info-label");
-        monitorInfoLabel.setWrapText(true);
+        monitorStopButton = new Button("Stop monitor");
+        monitorStopButton.getStyleClass().add("danger-button");
+        monitorStopButton.setDisable(true);
+        monitorStopButton.setOnAction(event -> handleStopMonitor());
         monitorScheduler = new MonitorScheduler(BID_ROWS_JSON_FILE, this::selectedPathsForDownload);
+        monitorScheduler.setOnCycleIdle(() -> Platform.runLater(this::updateSharedUiState));
         loadMonitorSettings();
         applyDownloadDisabledUi();
     }
@@ -459,7 +452,7 @@ public final class DownloaderFxApp extends Application {
         Label logTitle = new Label("Progress");
         logTitle.getStyleClass().add("section-title");
         
-        HBox statsBar = new HBox(12, loadedLabel, successLabel, failedLabel);
+        HBox statsBar = new HBox(12, loadedLabel, runningLabel, downloadedFilesLabel, successLabel, failedLabel);
         statsBar.setAlignment(Pos.CENTER_LEFT);
         
         Region logSpacer = new Region();
@@ -468,7 +461,8 @@ public final class DownloaderFxApp extends Application {
         HBox logHeader = new HBox(20, logTitle, statsBar, logSpacer, viewLogButton, expandProgressButton);
         logHeader.setAlignment(Pos.CENTER_LEFT);
 
-        VBox logCard = new VBox(12, logHeader, progressTableView);
+        VBox agentFilePanel = buildAgentFilePanel();
+        VBox logCard = new VBox(12, logHeader, currentActivityLabel, progressTableView, agentFilePanel);
         logCard.getStyleClass().add("card-panel");
 
         VBox rightColumn = new VBox(12, controlCard);
@@ -503,10 +497,17 @@ public final class DownloaderFxApp extends Application {
         Tab reportTab = new Tab("Report", reportScroll);
         reportTab.setClosable(false);
 
-        settingsCard.setMinHeight(500);
-        ScrollPane settingsScroll = new ScrollPane(settingsCard);
+        settingsCard.setMinHeight(Region.USE_PREF_SIZE);
+        settingsCard.setMaxWidth(Double.MAX_VALUE);
+        VBox settingsContent = new VBox(settingsCard);
+        settingsContent.setPadding(new Insets(2, 0, 2, 0));
+        settingsContent.setFillWidth(true);
+        ScrollPane settingsScroll = new ScrollPane(settingsContent);
         settingsScroll.setFitToWidth(true);
-        settingsScroll.setFitToHeight(true);
+        settingsScroll.setFitToHeight(false);
+        settingsScroll.setPannable(true);
+        settingsScroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+        settingsScroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.ALWAYS);
         settingsScroll.setStyle("-fx-background-color: transparent;");
         Tab settingsTab = new Tab("Settings", settingsScroll);
         settingsTab.setClosable(false);
@@ -521,7 +522,10 @@ public final class DownloaderFxApp extends Application {
         BorderPane root = new BorderPane(mainContent);
         root.getStyleClass().add("app-root");
 
-        Scene scene = new Scene(root, 940, 640);
+        StackPane rootStack = new StackPane(root, toastLayer);
+        rootStack.getStyleClass().add("app-root");
+
+        Scene scene = new Scene(rootStack, 940, 640);
         scene.getStylesheets().add(getClass().getResource("/vn/muasamcong/downloader/styles.css").toExternalForm());
 
         stage.setScene(scene);
@@ -547,6 +551,28 @@ public final class DownloaderFxApp extends Application {
         return panel;
     }
 
+    private VBox buildAgentFilePanel() {
+        agentFileTitleLabel = new Label("Files: select a keyword");
+        agentFileTitleLabel.getStyleClass().add("section-title-small");
+        agentFileFolderLabel = new Label("Folder: -");
+        agentFileFolderLabel.getStyleClass().add("field-hint");
+
+        return buildAgentFilePanel(agentFileTitleLabel, agentFileFolderLabel, agentFileTableView, false);
+    }
+
+    private VBox buildAgentFilePanel(
+        Label titleLabel,
+        Label folderLabel,
+        TableView<AgentFileProgressRow> tableView,
+        boolean expanded
+    ) {
+        VBox header = new VBox(2, titleLabel, folderLabel);
+        VBox panel = new VBox(8, header, tableView);
+        panel.getStyleClass().add("agent-file-panel");
+        VBox.setVgrow(tableView, expanded ? Priority.ALWAYS : Priority.NEVER);
+        return panel;
+    }
+
     private VBox buildFolderCard() {
         Label title = new Label("Folder scope");
         title.getStyleClass().add("section-title");
@@ -559,31 +585,12 @@ public final class DownloaderFxApp extends Application {
     }
 
     private VBox buildControlCard() {
-        Label title = new Label("Run controls");
+        Label title = new Label("Monitor controls");
         title.getStyleClass().add("section-title");
 
-        Label concurrencyLabel = new Label("Concurrency:");
-        concurrencyLabel.getStyleClass().add("field-label");
-        HBox concurrencyBox = new HBox(10, concurrencyLabel, concurrencySpinner);
-        concurrencyBox.setAlignment(Pos.CENTER_LEFT);
-
-        HBox topBar = new HBox(
-            10,
-            concurrencyBox,
-            new Region()
-        );
-        HBox.setHgrow(topBar.getChildren().get(1), Priority.ALWAYS);
-        topBar.setAlignment(Pos.CENTER_LEFT);
-
-        Region buttonSpacer = new Region();
-        HBox.setHgrow(buttonSpacer, Priority.ALWAYS);
-        HBox actionButtons = new HBox(10, buttonSpacer, stopButton, startButton);
-        actionButtons.setAlignment(Pos.CENTER_LEFT);
-
-        VBox autoRunBar = buildAutoRunBar();
         VBox monitorBar = buildMonitorBar();
 
-        VBox card = new VBox(12, title, topBar, actionButtons, new Separator(), autoRunBar, new Separator(), monitorBar);
+        VBox card = new VBox(12, title, monitorBar);
         VBox.setVgrow(monitorBar, Priority.ALWAYS);
         card.getStyleClass().add("card-panel");
         return card;
@@ -696,139 +703,48 @@ public final class DownloaderFxApp extends Application {
         return row;
     }
 
-    private VBox buildAutoRunBar() {
-        Label intervalLabel = new Label("Rest between sessions (minutes)");
-        intervalLabel.getStyleClass().add("field-label");
-
-        Label startTimeLabel = new Label("Start (HH:mm)");
-        startTimeLabel.getStyleClass().add("field-label");
-
-        Label stopTimeLabel = new Label("Stop (HH:mm)");
-        stopTimeLabel.getStyleClass().add("field-label");
-
-        HBox modeRow = new HBox(14, autoRunCheckBox);
-        modeRow.getStyleClass().add("autorun-row");
-        modeRow.setAlignment(Pos.CENTER_LEFT);
-
-        GridPane scheduleGrid = new GridPane();
-        scheduleGrid.setHgap(20);
-        scheduleGrid.setVgap(8);
-        
-        javafx.scene.layout.ColumnConstraints colConstraints = new javafx.scene.layout.ColumnConstraints();
-        colConstraints.setPrefWidth(115);
-        colConstraints.setMinWidth(115);
-        colConstraints.setMaxWidth(115);
-        scheduleGrid.getColumnConstraints().addAll(colConstraints, colConstraints, colConstraints);
-
-        scheduleGrid.add(intervalLabel, 0, 0);
-        scheduleGrid.add(startTimeLabel, 1, 0);
-        scheduleGrid.add(stopTimeLabel, 2, 0);
-        scheduleGrid.add(autoRunIntervalSpinner, 0, 1);
-        scheduleGrid.add(autoRunStartTimeField, 1, 1);
-        scheduleGrid.add(autoRunStopTimeField, 2, 1);
-
-        HBox gridRow = new HBox(scheduleGrid);
-        gridRow.getStyleClass().add("autorun-row");
-        gridRow.setAlignment(Pos.CENTER_LEFT);
-
-        HBox saveRow = new HBox(autoRunSaveButton);
-        saveRow.getStyleClass().add("autorun-row");
-        saveRow.setAlignment(Pos.CENTER_LEFT);
-
-        HBox infoRow = new HBox(autoRunInfoLabel);
-        infoRow.getStyleClass().add("autorun-info-row");
-        infoRow.setAlignment(Pos.CENTER_LEFT);
-
-        Label daysLabel = new Label("Days");
-        daysLabel.getStyleClass().add("field-label");
-        HBox daysTitleRow = new HBox(daysLabel);
-        daysTitleRow.getStyleClass().add("autorun-row");
-        daysTitleRow.setAlignment(Pos.CENTER_LEFT);
-
-        FlowPane daysRow = new FlowPane(16, 8);
-        daysRow.getChildren().addAll(autoRunDayChecks);
-        daysRow.getStyleClass().add("autorun-row");
-
-        Region spacer = new Region();
-        VBox.setVgrow(spacer, Priority.ALWAYS);
-
-        VBox box = new VBox(8, modeRow, infoRow, gridRow, daysTitleRow, daysRow, saveRow, spacer);
-        box.getStyleClass().add("autorun-box");
-        return box;
-    }
-
     private VBox buildMonitorBar() {
-        Label title = new Label("Monitor");
-        title.getStyleClass().add("field-label");
-        title.getStyleClass().add("field-label-strong");
-
         Label intervalLabel = new Label("Cycle interval (minutes)");
         intervalLabel.getStyleClass().add("field-label");
         HBox intervalBox = new HBox(10, intervalLabel, monitorIntervalSpinner);
         intervalBox.setAlignment(Pos.CENTER_LEFT);
 
-        Label monitorScopeHint = new Label(
-            "Phase 1: sync API + Google Sheet + export CSV/Excel (một lần). "
-                + "Phase 2 (tùy chọn): Selenium tải PDF/đính kèm vào auto-download.");
-        monitorScopeHint.getStyleClass().add("autorun-info-label");
-        monitorScopeHint.setWrapText(true);
+        Label agentThreadsLabel = new Label("Số luồng tải file (agent)");
+        agentThreadsLabel.getStyleClass().add("field-label");
+        HBox agentThreadsBox = new HBox(10, agentThreadsLabel, agentDownloadConcurrencySpinner);
+        agentThreadsBox.setAlignment(Pos.CENTER_LEFT);
 
-        HBox actions = new HBox(10, monitorSaveButton, monitorRunOnceButton);
+        Label seleniumThreadsLabel = new Label("Số tab Chrome (Selenium BBMT)");
+        seleniumThreadsLabel.getStyleClass().add("field-label");
+        HBox seleniumThreadsBox = new HBox(10, seleniumThreadsLabel, seleniumDownloadConcurrencySpinner);
+        seleniumThreadsBox.setAlignment(Pos.CENTER_LEFT);
+
+        HBox actions = new HBox(10, monitorRunNowButton, monitorSaveButton, monitorStopButton);
         actions.setAlignment(Pos.CENTER_LEFT);
 
-        VBox box = new VBox(
-            8,
-            title,
-            monitorEnabledCheckBox,
-            monitorDownloadAfterSheetCheckBox,
-            monitorScopeHint,
-            monitorInfoLabel,
-            intervalBox,
-            actions
-        );
+        VBox box = new VBox(8, intervalBox, agentThreadsBox, seleniumThreadsBox, bbmtSeleniumDownloadCheckBox, actions);
         box.getStyleClass().add("autorun-box");
         return box;
     }
 
     private void setupListeners() {
-        startButton.setOnAction(event -> handlePrimaryRunAction());
         bindFolderSelectionState();
     }
 
-    private void handlePrimaryRunAction() {
-        if (AppFeatures.isDownloadEnabled()) {
-            startDownload(false);
-            return;
-        }
-        startMonitorOnce();
-    }
-
-    private void startDownload(boolean autoTriggered) {
+    private void startDownload() {
         if (!AppFeatures.isDownloadEnabled()) {
             return;
         }
         if (activeDownloadTask != null) {
-            if (autoTriggered) {
-                updateStatus("Auto-run skipped", "status-running");
-                addDetailLog("Auto run: cycle is already running.");
-            } else {
-                updateStatus("Download is running", "status-running");
-            }
+            updateStatus("Download is running", "status-running");
             return;
         }
         if (ExecutionGate.isMonitorBusy()) {
-            if (autoTriggered) {
-                updateStatus("Auto-run skipped", "status-running");
-                addDetailLog("Auto run: skipped because monitor cycle is running (API + sheet only).");
-            } else {
-                updateStatus("Monitor is running", "status-running");
-                addDetailLog("Download: skipped because monitor cycle is running.");
-            }
+            updateStatus("Monitor is running", "status-running");
+            addDetailLog("Download: skipped because monitor cycle is running.");
             return;
         }
         stopRequestedByUser = false;
-        stopRequestedByScheduler = false;
-        activeRunAutoTriggered = autoTriggered;
         clearRunData();
         refreshProgressView();
         List<Path> selectedRoots = selectedPathsForDownload();
@@ -838,20 +754,17 @@ public final class DownloaderFxApp extends Application {
             return;
         }
 
-        int concurrency = Math.max(1, normalizeConcurrency(concurrencySpinner.getValue()));
+        int concurrency = monitorScheduler == null
+            ? AppFeatures.SELENIUM_DOWNLOAD_MAX_CONCURRENCY_DEFAULT
+            : monitorScheduler.loadSettings().normalized().seleniumDownloadConcurrency();
         if (!ExecutionGate.tryBeginDownload()) {
-            if (autoTriggered) {
-                updateStatus("Auto-run skipped", "status-running");
-                addDetailLog("Auto run: skipped because monitor cycle is running (API + sheet only).");
-            } else {
-                updateStatus("Monitor is running", "status-running");
-                addDetailLog("Download: skipped because monitor cycle is running.");
-            }
+            updateStatus("Monitor is running", "status-running");
+            addDetailLog("Download: skipped because monitor cycle is running.");
             return;
         }
 
-        updateStatus(autoTriggered ? "Auto run started..." : "Download started...", "status-running");
-        addDetailLog((autoTriggered ? "Auto run" : "Download") + ": started.");
+        updateStatus("Download is running", "status-running");
+        addDetailLog("Download: started.");
 
         Task<RunStats> task = new Task<>() {
             @Override
@@ -865,14 +778,14 @@ public final class DownloaderFxApp extends Application {
 
         task.setOnSucceeded(event -> {
             RunStats stats = task.getValue();
-            boolean wasStopped = stopRequestedByUser || stopRequestedByScheduler;
+            boolean wasStopped = stopRequestedByUser;
             if (wasStopped) {
                 applyStoppedStateMessage();
                 addDetailLog("Bid sheet sync ran for keywords completed before stop.");
             } else {
-                updateStatus(autoTriggered ? "Auto run completed" : "Download completed", "status-success");
+                updateStatus("Download completed", "status-success");
             }
-            addDetailLog((autoTriggered ? "Auto run" : "Download") + (wasStopped ? " stopped" : " completed") + ": "
+            addDetailLog("Download" + (wasStopped ? " stopped" : " completed") + ": "
                 + (stats == null ? 0 : stats.getSuccessCount()) + " success, "
                 + (stats == null ? 0 : stats.getFailCount()) + " failed.");
             updateReportFromConfig();
@@ -882,7 +795,7 @@ public final class DownloaderFxApp extends Application {
         task.setOnFailed(event -> {
             Throwable ex = task.getException();
             if (isAllKeywordsCompletedError(ex)) {
-                handleAllKeywordsCompletedNotice(autoTriggered);
+                handleAllKeywordsCompletedNotice();
             } else {
                 updateStatus("Download failed", "status-error");
                 addDetailLog("Download failed: " + summarizeException(ex));
@@ -895,7 +808,7 @@ public final class DownloaderFxApp extends Application {
             finishDownloadTask();
         });
 
-        Thread thread = new Thread(task, autoTriggered ? "Auto-Run-Task" : "Download-Task");
+        Thread thread = new Thread(task, "Download-Task");
         thread.setDaemon(true);
         thread.start();
     }
@@ -908,34 +821,11 @@ public final class DownloaderFxApp extends Application {
         return message.contains("already completed") || message.contains("all selected keywords");
     }
 
-    private void handleAllKeywordsCompletedNotice(boolean autoTriggered) {
+    private void handleAllKeywordsCompletedNotice() {
         updateStatus("All keywords completed", "status-success");
         addDetailLog("All selected keywords have already been processed successfully in previous runs.");
         addDetailLog("No pending keyword remains for this run.");
         addDetailLog("If you want to run again, use 'Clear run state' in Settings.");
-
-        if (autoTriggered) {
-            LocalDateTime now = LocalDateTime.now();
-            if (autoNoPendingAlertShowing) {
-                addDetailLog("Auto run: no-pending popup is already showing. Skip duplicate popup.");
-                return;
-            }
-            if (lastAutoNoPendingAlertAt != null
-                && Duration.between(lastAutoNoPendingAlertAt, now).toMinutes() < 10) {
-                addDetailLog("Auto run: no-pending popup suppressed (cooldown 10 minutes).");
-                return;
-            }
-
-            autoNoPendingAlertShowing = true;
-            try {
-                showNoPendingKeywordsAlert();
-                lastAutoNoPendingAlertAt = LocalDateTime.now();
-            } finally {
-                autoNoPendingAlertShowing = false;
-            }
-            return;
-        }
-
         showNoPendingKeywordsAlert();
     }
 
@@ -948,19 +838,82 @@ public final class DownloaderFxApp extends Application {
         alert.showAndWait();
     }
 
-    private void handleStopAction() {
+    private void handleStopMonitor() {
         if (activeDownloadTask != null) {
             handleStopDownload();
             return;
         }
-        if (activeMonitorTask == null) {
+        if (monitorScheduler == null || !monitorScheduler.isCycleActive()) {
             return;
         }
-        stopButton.setDisable(true);
+        monitorStopButton.setDisable(true);
         updateStatus("Stopping monitor...", "status-running");
         addDetailLog("Monitor: stop requested...");
+        monitorScheduler.requestStop();
         DownloadCoordinator.requestStop();
-        activeMonitorTask.cancel(true);
+    }
+
+    private void startMonitorNow() {
+        if (monitorScheduler == null) {
+            return;
+        }
+        if (monitorScheduler.isCycleActive() || activeDownloadTask != null || ExecutionGate.isDownloadBusy()) {
+            updateStatus("Already running", "status-running");
+            return;
+        }
+        try {
+            MonitorSettings settings = buildMonitorSettingsFromUi();
+            monitorIntervalSpinner.getValueFactory().setValue(settings.intervalMinutes());
+            agentDownloadConcurrencySpinner.getValueFactory().setValue(settings.agentDownloadConcurrency());
+            seleniumDownloadConcurrencySpinner.getValueFactory().setValue(settings.seleniumDownloadConcurrency());
+            applyAgentDownloadConcurrency(settings.agentDownloadConcurrency());
+            monitorScheduler.saveSettings(settings);
+        } catch (Exception ex) {
+            updateStatus("Monitor config invalid", "status-error");
+            addDetailLog("Unable to save monitor settings before run: " + ex.getMessage());
+            return;
+        }
+
+        clearRunData();
+        refreshProgressView();
+        updateStatus("Monitor is running", "status-running");
+        addDetailLog("Monitor: run now started.");
+        setDownloadRunningState(true);
+
+        Task<Void> task = new Task<>() {
+            @Override
+            protected Void call() {
+                monitorScheduler.runOnce();
+                return null;
+            }
+        };
+        task.setOnSucceeded(event -> {
+            int unfinishedAgentFiles = countUnfinishedAgentFiles();
+            if (unfinishedAgentFiles > 0) {
+                updateStatus("Monitor incomplete", "status-error");
+                addDetailLog("Monitor: run now completed with " + unfinishedAgentFiles
+                    + " agent file(s) not downloaded yet.");
+            } else {
+                updateStatus("Monitor completed", "status-success");
+                addDetailLog("Monitor: run now completed.");
+            }
+            updateReportFromConfig();
+            setDownloadRunningState(false);
+        });
+        task.setOnFailed(event -> {
+            Throwable ex = task.getException();
+            updateStatus("Monitor failed", "status-error");
+            addDetailLog("Monitor run failed: " + summarizeException(ex));
+            setDownloadRunningState(false);
+        });
+        task.setOnCancelled(event -> {
+            applyStoppedStateMessage();
+            setDownloadRunningState(false);
+        });
+
+        Thread thread = new Thread(task, "Monitor-RunNow");
+        thread.setDaemon(true);
+        thread.start();
     }
 
     private void handleStopDownload() {
@@ -968,9 +921,9 @@ public final class DownloaderFxApp extends Application {
             return;
         }
         stopRequestedByUser = true;
-        stopRequestedByScheduler = false;
-        autoRestartAfterStop = false;
-        stopButton.setDisable(true);
+        if (monitorStopButton != null) {
+            monitorStopButton.setDisable(true);
+        }
         updateStatus("Stopping download...", "status-running");
         addDetailLog("Download stop requested... (will export sheet when workers finish)");
         DownloadCoordinator.requestStop();
@@ -978,11 +931,7 @@ public final class DownloaderFxApp extends Application {
 
     private void applyStoppedStateMessage() {
         updateStatus("Stopped", "status-error");
-        if (stopRequestedByScheduler) {
-            addDetailLog("=== STOPPED FOR SCHEDULED AUTO-RUN CYCLE ===");
-        } else {
-            addDetailLog("=== STOPPED BY USER REQUEST ===");
-        }
+        addDetailLog("=== STOPPED BY USER REQUEST ===");
     }
 
     private void handleOpenReport() {
@@ -1756,12 +1705,12 @@ public final class DownloaderFxApp extends Application {
 
             if (config.autoSync()) {
                 if (config.spreadsheetId() == null || config.spreadsheetId().isBlank()) {
-                    updateStatus("Config invalid", "status-error");
+                    showToast("Config invalid", true);
                     addDetailLog("Google Sheets config error: Spreadsheet ID is required when auto sync is enabled.");
                     return;
                 }
                 if (config.credentialsFile() == null || config.credentialsFile().isBlank()) {
-                    updateStatus("Config invalid", "status-error");
+                    showToast("Config invalid", true);
                     addDetailLog("Google Sheets config error: Credentials JSON path is required when auto sync is enabled.");
                     return;
                 }
@@ -1770,11 +1719,11 @@ public final class DownloaderFxApp extends Application {
             try {
                 GoogleSheetsConfigStore.save(config);
                 updateReportFromConfig();
-                updateStatus("Config saved", "status-success");
+                showToast("Config saved", false);
                 addDetailLog("Google Sheets configuration saved.");
                 dialog.close();
             } catch (Exception ex) {
-                updateStatus("Save config failed", "status-error");
+                showToast("Save config failed", true);
                 addDetailLog("Failed to save Google Sheets configuration: " + ex.getMessage());
             }
         });
@@ -1783,41 +1732,24 @@ public final class DownloaderFxApp extends Application {
     }
 
     private void finishDownloadTask() {
-        boolean shouldRestart = autoRestartAfterStop;
         activeDownloadTask = null;
-        autoRestartAfterStop = false;
-        activeRunAutoTriggered = false;
         stopRequestedByUser = false;
-        stopRequestedByScheduler = false;
         setDownloadRunningState(false);
         viewLogButton.setDisable(false);
         ExecutionGate.endDownload();
-        if (shouldRestart && AppFeatures.isDownloadEnabled()) {
-            addDetailLog("Auto run: starting new cycle now.");
-            startDownload(true);
-        }
     }
 
     private void setDownloadRunningState(boolean running) {
-        if (AppFeatures.isDownloadEnabled()) {
-            startButton.setDisable(running);
-            stopButton.setDisable(!running);
-            concurrencySpinner.setDisable(running);
-        }
         updateSharedUiState();
     }
 
     /** Update shared UI elements based on whether ANY task is running. */
     private void updateSharedUiState() {
         boolean downloadRunning = activeDownloadTask != null || ExecutionGate.isDownloadBusy();
-        boolean monitorRunning = activeMonitorTask != null || ExecutionGate.isMonitorBusy();
+        boolean monitorRunning = monitorScheduler != null && monitorScheduler.isCycleActive();
         boolean anyRunning = downloadRunning || monitorRunning;
-        boolean downloadAllowed = AppFeatures.isDownloadEnabled();
-        boolean monitorDownloadAllowed = AppFeatures.isMonitorSeleniumAfterSheetEnabled();
         runningState = anyRunning;
-        startButton.setDisable(anyRunning || countSelectedFolders() <= 0);
-        stopButton.setDisable(!anyRunning);
-        concurrencySpinner.setDisable((!downloadAllowed && !monitorDownloadAllowed) || anyRunning);
+        refreshMonitorActionButtons();
         folderListView.setDisable(anyRunning);
         addFolderButton.setDisable(anyRunning);
         deleteFolderButton.setDisable(anyRunning);
@@ -1828,22 +1760,14 @@ public final class DownloaderFxApp extends Application {
         sheetsConfigButton.setDisable(anyRunning);
         browserProfileComboBox.setDisable(anyRunning);
         saveBrowserProfileButton.setDisable(anyRunning);
-        boolean autoRunUiEnabled = downloadAllowed && !anyRunning;
-        autoRunCheckBox.setDisable(!autoRunUiEnabled);
-        autoRunStartTimeField.setDisable(!autoRunUiEnabled);
-        autoRunStopTimeField.setDisable(!autoRunUiEnabled);
-        autoRunSaveButton.setDisable(!autoRunUiEnabled);
-        monitorEnabledCheckBox.setDisable(anyRunning);
-        if (monitorDownloadAfterSheetCheckBox != null) {
-            monitorDownloadAfterSheetCheckBox.setDisable(anyRunning || !monitorDownloadAllowed);
-        }
         monitorIntervalSpinner.setDisable(anyRunning);
+        agentDownloadConcurrencySpinner.setDisable(anyRunning);
+        if (seleniumDownloadConcurrencySpinner != null) {
+            seleniumDownloadConcurrencySpinner.setDisable(anyRunning);
+        }
         monitorSaveButton.setDisable(anyRunning);
-        monitorRunOnceButton.setDisable(anyRunning || countSelectedFolders() <= 0);
         progressIndicator.setVisible(anyRunning);
         progressIndicator.setManaged(anyRunning);
-        refreshAutoRunModeUi();
-        refreshStartButtonAvailability();
     }
 
     private void bindFolderSelectionState() {
@@ -1861,14 +1785,14 @@ public final class DownloaderFxApp extends Application {
                 }
             }
             updateFolderSelectionLabel();
-            refreshStartButtonAvailability();
+            refreshMonitorActionButtons();
         });
 
         for (FolderItem item : folderItems) {
             registerFolderItemListener(item);
         }
         updateFolderSelectionLabel();
-        refreshStartButtonAvailability();
+        refreshMonitorActionButtons();
     }
 
     private void registerFolderItemListener(FolderItem item) {
@@ -1877,7 +1801,7 @@ public final class DownloaderFxApp extends Application {
         }
         ChangeListener<Boolean> listener = (obs, oldVal, newVal) -> {
             updateFolderSelectionLabel();
-            refreshStartButtonAvailability();
+            refreshMonitorActionButtons();
         };
         item.selectedProperty().addListener(listener);
         folderSelectionListeners.put(item, listener);
@@ -1910,48 +1834,57 @@ public final class DownloaderFxApp extends Application {
     }
 
     private void applyDownloadDisabledUi() {
-        if (AppFeatures.isDownloadEnabled()) {
-            return;
-        }
-        shutdownAutoRunScheduler();
-        startButton.setText("RUN");
-        if (!AppFeatures.isMonitorSeleniumAfterSheetEnabled()) {
-            concurrencySpinner.setDisable(true);
-        }
-        autoRunCheckBox.setSelected(false);
-        autoRunCheckBox.setDisable(true);
-        autoRunIntervalSpinner.setDisable(true);
-        autoRunStartTimeField.setDisable(true);
-        autoRunStopTimeField.setDisable(true);
-        autoRunDayChecks.forEach(cb -> cb.setDisable(true));
-        autoRunSaveButton.setDisable(true);
-        refreshStartButtonAvailability();
-        addDetailLog("Download (Selenium) standalone tắt. RUN = Monitor (API + sheet). "
-            + "Bật checkbox Monitor để tải file sau sheet.");
+        refreshMonitorActionButtons();
     }
 
-    private void refreshStartButtonAvailability() {
+    private void refreshMonitorActionButtons() {
         boolean hasSelection = countSelectedFolders() > 0;
-        startButton.setDisable(runningState || !hasSelection);
-        if (monitorRunOnceButton != null) {
-            monitorRunOnceButton.setDisable(runningState || !hasSelection);
+        boolean monitorRunning = monitorScheduler != null && monitorScheduler.isCycleActive();
+        boolean downloadRunning = activeDownloadTask != null || ExecutionGate.isDownloadBusy();
+        boolean anyRunning = monitorRunning || downloadRunning;
+        if (monitorRunNowButton != null) {
+            monitorRunNowButton.setDisable(anyRunning || !hasSelection);
         }
+        if (monitorStopButton != null) {
+            monitorStopButton.setDisable(!anyRunning);
+        }
+    }
+
+    private MonitorSettings buildMonitorSettingsFromUi() {
+        return new MonitorSettings(
+            true,
+            monitorIntervalSpinner.getValue(),
+            true,
+            agentDownloadConcurrencySpinner.getValue(),
+            bbmtSeleniumDownloadCheckBox != null && bbmtSeleniumDownloadCheckBox.isSelected(),
+            seleniumDownloadConcurrencySpinner.getValue()
+        ).normalized();
+    }
+
+    private void applyAgentDownloadConcurrency(int threads) {
+        EgpAgentFileDownloadService.setMaxConcurrency(threads);
     }
 
     private void loadMonitorSettings() {
         try {
-            MonitorSettings settings = monitorScheduler.loadSettings();
-            monitorEnabledCheckBox.setSelected(settings.enabled());
-            if (monitorDownloadAfterSheetCheckBox != null) {
-                monitorDownloadAfterSheetCheckBox.setSelected(settings.downloadFilesAfterSheet());
-            }
+            MonitorSettings loaded = monitorScheduler.loadSettings().normalized();
+            MonitorSettings settings = new MonitorSettings(
+                true,
+                loaded.intervalMinutes(),
+                true,
+                loaded.agentDownloadConcurrency(),
+                loaded.bbmtSeleniumDownload(),
+                loaded.seleniumDownloadConcurrency()
+            ).normalized();
             monitorIntervalSpinner.getValueFactory().setValue(settings.intervalMinutes());
-            updateMonitorInfoLabel();
-            if (settings.enabled()) {
-                monitorScheduler.start();
-            } else {
-                monitorScheduler.stop();
+            agentDownloadConcurrencySpinner.getValueFactory().setValue(settings.agentDownloadConcurrency());
+            seleniumDownloadConcurrencySpinner.getValueFactory().setValue(settings.seleniumDownloadConcurrency());
+            if (bbmtSeleniumDownloadCheckBox != null) {
+                bbmtSeleniumDownloadCheckBox.setSelected(settings.bbmtSeleniumDownload());
             }
+            applyAgentDownloadConcurrency(settings.agentDownloadConcurrency());
+            monitorScheduler.saveSettings(settings);
+            monitorScheduler.start();
         } catch (Exception ex) {
             addDetailLog("Failed to load monitor settings: " + ex.getMessage());
         }
@@ -1959,215 +1892,22 @@ public final class DownloaderFxApp extends Application {
 
     private void saveMonitorSettings() {
         try {
-            MonitorSettings settings = new MonitorSettings(
-                monitorEnabledCheckBox.isSelected(),
-                monitorIntervalSpinner.getValue(),
-                monitorDownloadAfterSheetCheckBox != null && monitorDownloadAfterSheetCheckBox.isSelected()
-            ).normalized();
-            if (settings.enabled() && autoRunCheckBox.isSelected()) {
-                Alert warning = new Alert(Alert.AlertType.WARNING);
-                warning.initOwner(ownerStage);
-                warning.setTitle("Monitor and Auto Run");
-                warning.setHeaderText("Monitor and Auto Run are both enabled");
-                warning.setContentText(
-                    "Monitor only syncs API data and Google Sheet; it does not download PDF files.\n"
-                        + "Auto Run uses Selenium to download files and may run when Monitor is idle.\n\n"
-                        + "Turn off Auto Run if you only want API/sheet sync without Selenium.");
-                warning.showAndWait();
-            }
+            MonitorSettings settings = buildMonitorSettingsFromUi();
             monitorIntervalSpinner.getValueFactory().setValue(settings.intervalMinutes());
+            agentDownloadConcurrencySpinner.getValueFactory().setValue(settings.agentDownloadConcurrency());
+            seleniumDownloadConcurrencySpinner.getValueFactory().setValue(settings.seleniumDownloadConcurrency());
+            applyAgentDownloadConcurrency(settings.agentDownloadConcurrency());
             monitorScheduler.saveSettings(settings);
-            updateMonitorInfoLabel();
-            updateStatus("Monitor settings saved", "status-success");
-            addDetailLog("Monitor settings saved. Enabled=" + settings.enabled()
-                + ", interval=" + settings.intervalMinutes() + "m"
-                + ", downloadAfterSheet=" + settings.downloadFilesAfterSheet() + ".");
+            showToast("Monitor settings saved", false);
+            addDetailLog(
+                "Monitor settings saved. Interval=" + settings.intervalMinutes()
+                    + "m, agent threads=" + settings.agentDownloadConcurrency()
+                    + ", Selenium Chrome=" + settings.seleniumDownloadConcurrency()
+                    + ", BBMT Selenium=" + settings.bbmtSeleniumDownload() + "."
+            );
         } catch (Exception ex) {
-            updateStatus("Monitor save failed", "status-error");
+            showToast("Monitor save failed", true);
             addDetailLog("Unable to save monitor settings: " + ex.getMessage());
-        }
-    }
-
-    private void startMonitorOnce() {
-        if (activeMonitorTask != null) {
-            addDetailLog("Monitor: a cycle is already running.");
-            return;
-        }
-        if (activeDownloadTask != null || ExecutionGate.isDownloadBusy()) {
-            addDetailLog("Monitor: skipped because download (Selenium) is running.");
-            return;
-        }
-        if (ExecutionGate.isMonitorBusy()) {
-            addDetailLog("Monitor: a cycle is already running.");
-            return;
-        }
-        List<Path> selectedRoots = selectedPathsForDownload();
-        if (selectedRoots.isEmpty()) {
-            updateStatus("No folder selected", "status-error");
-            addDetailLog("Monitor: no folder selected.");
-            return;
-        }
-
-        updateStatus("Monitor running...", "status-running");
-        addDetailLog("Monitor: cycle started.");
-
-        int concurrency = Math.max(1, normalizeConcurrency(concurrencySpinner.getValue()));
-        Task<MonitorCycleResult> task = new Task<>() {
-            @Override
-            protected MonitorCycleResult call() {
-                return monitorScheduler.runOnce(concurrency);
-            }
-        };
-
-        task.setOnSucceeded(event -> {
-            MonitorCycleResult result = task.getValue();
-            activeMonitorTask = null;
-            updateSharedUiState();
-            updateReportFromConfig();
-            if (result != null && isMonitorSkippedResult(result)) {
-                updateStatus("Monitor skipped", "status-running");
-                addDetailLog("Monitor: cycle skipped (" + result.errorSummary() + ").");
-                updateMonitorInfoLabel();
-                return;
-            }
-            if (result != null && result.interrupted()) {
-                updateStatus("Monitor interrupted", "status-running");
-            } else {
-                updateStatus("Monitor completed", "status-success");
-            }
-            if (result != null) {
-                addDetailLog("Monitor: discovered=" + result.discoveredCount()
-                    + ", apiSynced=" + result.apiSyncedCount()
-                    + ", skipped=" + result.apiSkippedCount()
-                    + ", failed=" + result.apiFailedCount()
-                    + ", sheetRows=" + result.sheetRowCount()
-                    + ", sheetChanged=" + result.sheetChanged()
-                    + ", downloadQueued=" + result.downloadQueued()
-                    + ", downloadSuccess=" + result.downloadSuccess()
-                    + ", downloadFailed=" + result.downloadFailed()
-                    + ", downloadSkipped=" + result.downloadSkipped());
-            }
-            updateMonitorInfoLabel();
-        });
-
-        task.setOnFailed(event -> {
-            Throwable ex = task.getException();
-            activeMonitorTask = null;
-            updateSharedUiState();
-            updateStatus("Monitor failed", "status-error");
-            addDetailLog("Monitor failed: " + (ex != null ? ex.getMessage() : "Unknown"));
-            updateMonitorInfoLabel();
-        });
-
-        task.setOnCancelled(event -> {
-            activeMonitorTask = null;
-            updateSharedUiState();
-            updateStatus("Monitor stopped", "status-error");
-            addDetailLog("Monitor: stopped.");
-            updateMonitorInfoLabel();
-        });
-
-        activeMonitorTask = task;
-        updateSharedUiState();
-        Thread worker = new Thread(task, "Monitor-Cycle-Worker");
-        worker.setDaemon(true);
-        worker.start();
-    }
-
-    private static boolean isMonitorSkippedResult(MonitorCycleResult result) {
-        if (result == null || result.interrupted()) {
-            return false;
-        }
-        String summary = result.errorSummary();
-        if (summary == null || summary.isBlank()) {
-            return false;
-        }
-        return result.discoveredCount() == 0
-            && result.apiSyncedCount() == 0
-            && result.apiSkippedCount() == 0
-            && result.apiFailedCount() == 0
-            && result.sheetRowCount() == 0;
-    }
-
-    private void updateMonitorInfoLabel() {
-        if (monitorInfoLabel == null) {
-            return;
-        }
-        MonitorSettings settings = monitorScheduler == null
-            ? MonitorSettings.defaults()
-            : monitorScheduler.loadSettings();
-        String latest = monitorScheduler == null
-            ? ""
-            : monitorScheduler.latestCycle()
-                .map(log -> "Last cycle: synced=" + log.apiSyncedCount()
-                    + ", failed=" + log.apiFailedCount()
-                    + ", sheetChanged=" + log.sheetChanged()
-                    + " at " + log.finishedAt())
-                .orElse("No cycle run yet.");
-        monitorInfoLabel.setText(
-            (settings.enabled() ? "Monitor ON" : "Monitor OFF")
-                + " | interval=" + settings.intervalMinutes() + "m"
-                + " | downloadAfterSheet=" + settings.downloadFilesAfterSheet()
-                + ". "
-                + latest
-        );
-    }
-
-    private void loadAutoRunConfig() {
-        try {
-            AutoRunConfigStore.AutoRunConfig config = AutoRunConfigStore.load().normalized();
-            boolean autoRunEnabled = config.enabled() && AppFeatures.isDownloadEnabled();
-            autoRunCheckBox.setSelected(autoRunEnabled);
-            autoRunIntervalSpinner.getValueFactory().setValue(config.intervalMinutes());
-            autoRunStartTimeField.setText(defaultText(config.startTime()));
-            autoRunStopTimeField.setText(defaultText(config.stopTime()));
-            applyAutoRunDaysToUi(config.days());
-            refreshAutoRunModeUi();
-            updateAutoRunTimeValidation();
-            applyAutoRunSchedule(autoRunEnabled, config.intervalMinutes(), config.startTime(), config.stopTime(), config.days(), false);
-        } catch (Exception ex) {
-            addDetailLog("Failed to load auto run config: " + ex.getMessage());
-        }
-    }
-
-    private void handleSaveAutoRunConfig() {
-        int intervalMinutes = normalizeAutoRunInterval(autoRunIntervalSpinner.getValue());
-        autoRunIntervalSpinner.getValueFactory().setValue(intervalMinutes);
-        if (!AppFeatures.isDownloadEnabled()) {
-            updateStatus("Download disabled", "status-error");
-            addDetailLog("Auto run requires Selenium download, which is disabled in this build.");
-            return;
-        }
-        boolean enabled = autoRunCheckBox.isSelected();
-        String startTime = normalizeSpecificTime(autoRunStartTimeField.getText());
-        String stopTime = normalizeSpecificTime(autoRunStopTimeField.getText());
-        String days = selectedAutoRunDaysCsv();
-
-        if (startTime == null || stopTime == null) {
-            updateStatus("Schedule save failed", "status-error");
-            addDetailLog("Invalid Start/Stop time. Use HH:mm format (e.g. 08:00, 18:00).");
-            updateAutoRunTimeValidation();
-            return;
-        }
-        if (days == null || days.isBlank()) {
-            updateStatus("Schedule save failed", "status-error");
-            addDetailLog("Please select at least one day for auto run.");
-            updateAutoRunTimeValidation();
-            return;
-        }
-
-        try {
-            applyAutoRunSchedule(enabled, intervalMinutes, startTime, stopTime, days, true);
-            updateStatus("Schedule saved", "status-success");
-            if (!enabled) {
-                addDetailLog("Auto run disabled.");
-            } else {
-                addDetailLog("Auto run enabled. Rest between sessions: " + intervalMinutes + " minute(s), window: "
-                    + startTime + " - " + stopTime + " | days: " + days + ".");
-            }
-        } catch (Exception ex) {
-            updateStatus("Schedule save failed", "status-error");
-            addDetailLog("Unable to save auto run config: " + ex.getMessage());
         }
     }
 
@@ -2194,19 +1934,12 @@ public final class DownloaderFxApp extends Application {
         }
         try {
             BrowserProfileConfigStore.save(new BrowserProfileConfigStore.BrowserProfileConfig(mode));
-            updateStatus("Browser mode saved", "status-success");
+            showToast("Browser mode saved", false);
             addDetailLog("Browser mode saved: " + mode + ". New sessions will use this mode.");
         } catch (Exception ex) {
-            updateStatus("Save failed", "status-error");
+            showToast("Save failed", true);
             addDetailLog("Unable to save browser mode: " + ex.getMessage());
         }
-    }
-
-    private int normalizeConcurrency(Integer value) {
-        if (value == null || value <= 0) {
-            return 1;
-        }
-        return Math.max(1, Math.min(value, 10));
     }
 
     private void ensureChromeProfilesForConcurrency(int concurrency) {
@@ -2215,321 +1948,6 @@ public final class DownloaderFxApp extends Application {
         Utils.ensureDirectory(base);
         for (int i = 1; i <= safeConcurrency; i++) {
             Utils.ensureDirectory(base.resolve("profile-" + i));
-        }
-    }
-
-    private String normalizeSpecificTime(String value) {
-        if (value == null || value.isBlank()) {
-            return null;
-        }
-        String time = value.trim();
-        if (!time.matches("^([01]\\d|2[0-3]):[0-5]\\d$")) {
-            return null;
-        }
-        return time;
-    }
-
-    private int normalizeAutoRunInterval(Integer value) {
-        if (value == null || value <= 0) {
-            return 1;
-        }
-        return Math.max(1, Math.min(value, 1440));
-    }
-
-    private void applyAutoRunSchedule(boolean enabled, int intervalMinutes, String startTime, String stopTime, String days, boolean persistConfig) {
-        int safeInterval = normalizeAutoRunInterval(intervalMinutes);
-        String safeStart = normalizeSpecificTime(startTime);
-        String safeStop = normalizeSpecificTime(stopTime);
-        String safeDays = normalizeAutoRunDaysCsv(days);
-        if (persistConfig) {
-            AutoRunConfigStore.save(new AutoRunConfigStore.AutoRunConfig(enabled, safeInterval, safeStart, safeStop, safeDays));
-        }
-        restartAutoRunScheduler(enabled, safeInterval, safeStart, safeStop, safeDays);
-        updateAutoRunInfoLabel();
-    }
-
-    private void restartAutoRunScheduler(boolean enabled, int intervalMinutes, String startTime, String stopTime, String days) {
-        shutdownAutoRunScheduler();
-        nextAutoRunAt = null;
-        if (!enabled) {
-            updateAutoRunInfoLabel();
-            return;
-        }
-
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread thread = new Thread(r, "Auto-Run-Scheduler");
-            thread.setDaemon(true);
-            return thread;
-        });
-
-        autoRunScheduler = scheduler;
-        scheduleNextAutoRun(intervalMinutes, startTime, stopTime, days);
-    }
-
-    private void scheduleNextAutoRun(int intervalMinutes, String startTime, String stopTime, String days) {
-        ScheduledExecutorService scheduler = autoRunScheduler;
-        if (scheduler == null) {
-            return;
-        }
-
-        LocalDateTime nextRun = calculateNextRun(intervalMinutes, startTime, stopTime, days);
-        nextAutoRunAt = nextRun;
-        Platform.runLater(this::updateAutoRunInfoLabel);
-
-        long delaySeconds = Math.max(1L, Duration.between(LocalDateTime.now(), nextRun).getSeconds());
-        scheduler.schedule(() -> Platform.runLater(() -> {
-            if (autoRunScheduler == null || !autoRunCheckBox.isSelected()) {
-                return;
-            }
-            handleAutoRunTick(startTime, stopTime, days);
-            scheduleNextAutoRun(intervalMinutes, startTime, stopTime, days);
-        }), delaySeconds, TimeUnit.SECONDS);
-    }
-
-    private LocalDateTime calculateNextRun(int intervalMinutes, String startTime, String stopTime, String days) {
-        LocalDateTime now = LocalDateTime.now();
-        String safeStart = normalizeSpecificTime(startTime);
-        String safeStop = normalizeSpecificTime(stopTime);
-        Set<Integer> allowedDays = parseAllowedDays(days);
-        if (safeStart == null || safeStop == null) {
-            return now.plusMinutes(intervalMinutes);
-        }
-        LocalTime start = LocalTime.parse(safeStart);
-        LocalTime stop = LocalTime.parse(safeStop);
-        LocalTime current = now.toLocalTime();
-        if (allowedDays.contains(now.getDayOfWeek().getValue()) && isWithinAutoRunWindow(current, start, stop)) {
-            return now.plusMinutes(intervalMinutes);
-        }
-        for (int addDays = 0; addDays <= 14; addDays++) {
-            LocalDate candidateDate = LocalDate.now().plusDays(addDays);
-            int dayValue = candidateDate.getDayOfWeek().getValue();
-            if (!allowedDays.contains(dayValue)) {
-                continue;
-            }
-            LocalDateTime candidateStart = candidateDate.atTime(start);
-            if (candidateStart.isAfter(now)) {
-                return candidateStart;
-            }
-        }
-        return now.plusMinutes(intervalMinutes);
-    }
-
-    private boolean isWithinAutoRunWindow(LocalTime current, LocalTime start, LocalTime stop) {
-        if (start.equals(stop)) {
-            return true;
-        }
-        if (start.isBefore(stop)) {
-            return !current.isBefore(start) && current.isBefore(stop);
-        }
-        return !current.isBefore(start) || current.isBefore(stop);
-    }
-
-    private void handleAutoRunTick(String startTime, String stopTime, String days) {
-        if (!AppFeatures.isDownloadEnabled()) {
-            return;
-        }
-        if (!autoRunCheckBox.isSelected()) {
-            return;
-        }
-
-        String safeStart = normalizeSpecificTime(startTime);
-        String safeStop = normalizeSpecificTime(stopTime);
-        String safeDays = normalizeAutoRunDaysCsv(days);
-        int intervalMinutes = normalizeAutoRunInterval(autoRunIntervalSpinner.getValue());
-        if (safeStart == null || safeStop == null) {
-            addDetailLog("Auto run: invalid Start/Stop time. Auto run disabled.");
-            autoRunCheckBox.setSelected(false);
-            applyAutoRunSchedule(false, intervalMinutes, autoRunStartTimeField.getText(), autoRunStopTimeField.getText(), safeDays, true);
-            return;
-        }
-        LocalTime now = LocalTime.now();
-        Set<Integer> allowedDays = parseAllowedDays(safeDays);
-        if (!allowedDays.contains(LocalDate.now().getDayOfWeek().getValue())
-            || !isWithinAutoRunWindow(now, LocalTime.parse(safeStart), LocalTime.parse(safeStop))) {
-            addDetailLog("Auto run: stop time reached. Auto run disabled.");
-            autoRunCheckBox.setSelected(false);
-            applyAutoRunSchedule(false, intervalMinutes, safeStart, safeStop, safeDays, true);
-            updateStatus("Auto run stopped", "status-success");
-            return;
-        }
-        addDetailLog("Auto run: cycle triggered (rest " + intervalMinutes + " minute(s), window "
-            + safeStart + "-" + safeStop + ").");
-
-        if (activeDownloadTask != null) {
-            autoRestartAfterStop = true;
-            addDetailLog("Auto run: current cycle still running, queued next cycle (graceful mode).");
-            return;
-        }
-        if (ExecutionGate.isMonitorBusy()) {
-            addDetailLog("Auto run: skipped because monitor cycle is running (API + sheet only).");
-            return;
-        }
-
-        startDownload(true);
-    }
-
-    private void updateAutoRunInfoLabel() {
-        boolean enabled = autoRunCheckBox.isSelected();
-        if (!enabled) {
-            autoRunInfoLabel.setText("Auto run is OFF");
-            return;
-        }
-
-        int intervalMinutes = normalizeAutoRunInterval(autoRunIntervalSpinner.getValue());
-        String startTime = normalizeSpecificTime(autoRunStartTimeField.getText());
-        String stopTime = normalizeSpecificTime(autoRunStopTimeField.getText());
-        String days = normalizeAutoRunDaysCsv(selectedAutoRunDaysCsv());
-
-        String scheduleText = "Rest " + intervalMinutes + "m"
-            + " • Window: " + (startTime == null ? "--:--" : startTime)
-            + "-" + (stopTime == null ? "--:--" : stopTime)
-            + " • Days: " + formatAutoRunDaysForLabel(days);
-
-        String nextRunText = nextAutoRunAt == null
-            ? ""
-            : " • Next: " + nextAutoRunAt.format(NEXT_RUN_FORMAT);
-        autoRunInfoLabel.setText(scheduleText + nextRunText);
-    }
-
-    private void refreshAutoRunModeUi() {
-        if (!AppFeatures.isDownloadEnabled()) {
-            autoRunIntervalSpinner.setDisable(true);
-            autoRunStartTimeField.setDisable(true);
-            autoRunStopTimeField.setDisable(true);
-            autoRunDayChecks.forEach(cb -> cb.setDisable(true));
-            return;
-        }
-        if (runningState) {
-            autoRunIntervalSpinner.setDisable(true);
-            autoRunStartTimeField.setDisable(true);
-            autoRunStopTimeField.setDisable(true);
-            autoRunDayChecks.forEach(cb -> cb.setDisable(true));
-            updateAutoRunTimeValidation();
-            return;
-        }
-        autoRunIntervalSpinner.setDisable(false);
-        autoRunStartTimeField.setDisable(false);
-        autoRunStopTimeField.setDisable(false);
-        autoRunDayChecks.forEach(cb -> cb.setDisable(false));
-        updateAutoRunTimeValidation();
-    }
-
-    private void updateAutoRunTimeValidation() {
-        String startTime = normalizeSpecificTime(autoRunStartTimeField.getText());
-        String stopTime = normalizeSpecificTime(autoRunStopTimeField.getText());
-        boolean noDaySelected = selectedAutoRunDaysCsv() == null;
-        boolean invalid = startTime == null || stopTime == null || noDaySelected;
-
-        autoRunStartTimeField.pseudoClassStateChanged(javafx.css.PseudoClass.getPseudoClass("error"), startTime == null);
-        autoRunStopTimeField.pseudoClassStateChanged(javafx.css.PseudoClass.getPseudoClass("error"), stopTime == null);
-
-        boolean canSave = !runningState && !invalid;
-        autoRunSaveButton.setDisable(!canSave);
-
-        if (invalid) {
-            autoRunInfoLabel.setText("Start/Stop time or days are invalid. Use HH:mm and select at least one day.");
-            autoRunInfoLabel.getStyleClass().remove("status-success");
-            if (!autoRunInfoLabel.getStyleClass().contains("status-error")) {
-                autoRunInfoLabel.getStyleClass().add("status-error");
-            }
-        } else {
-            autoRunInfoLabel.getStyleClass().remove("status-error");
-            if (!autoRunInfoLabel.getStyleClass().contains("field-hint")) {
-                autoRunInfoLabel.getStyleClass().add("field-hint");
-            }
-            updateAutoRunInfoLabel();
-        }
-    }
-
-    private String selectedAutoRunDaysCsv() {
-        String[] tokens = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"};
-        List<String> selected = new ArrayList<>();
-        for (int i = 0; i < autoRunDayChecks.size() && i < tokens.length; i++) {
-            if (autoRunDayChecks.get(i).isSelected()) {
-                selected.add(tokens[i]);
-            }
-        }
-        if (selected.isEmpty()) {
-            return null;
-        }
-        return String.join(",", selected);
-    }
-
-    private String normalizeAutoRunDaysCsv(String daysCsv) {
-        if (daysCsv == null || daysCsv.isBlank()) {
-            return null;
-        }
-        List<String> allowedOrder = Arrays.asList("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN");
-        LinkedHashSet<String> selected = new LinkedHashSet<>();
-        for (String part : daysCsv.split(",")) {
-            if (part == null) {
-                continue;
-            }
-            String token = part.trim().toUpperCase();
-            if (allowedOrder.contains(token)) {
-                selected.add(token);
-            }
-        }
-        if (selected.isEmpty()) {
-            return null;
-        }
-        List<String> ordered = new ArrayList<>();
-        for (String token : allowedOrder) {
-            if (selected.contains(token)) {
-                ordered.add(token);
-            }
-        }
-        return String.join(",", ordered);
-    }
-
-    private String formatAutoRunDaysForLabel(String daysCsv) {
-        String normalized = normalizeAutoRunDaysCsv(daysCsv);
-        if (normalized == null) {
-            return "-";
-        }
-        if ("MON,TUE,WED,THU,FRI,SAT,SUN".equals(normalized)) {
-            return "Everyday";
-        }
-        if ("MON,TUE,WED,THU,FRI".equals(normalized)) {
-            return "Mon-Fri";
-        }
-        if ("SAT,SUN".equals(normalized)) {
-            return "Sat-Sun";
-        }
-        String[] parts = normalized.split(",");
-        for (int i = 0; i < parts.length; i++) {
-            parts[i] = parts[i].substring(0, 1).toUpperCase() + parts[i].substring(1).toLowerCase();
-        }
-        return String.join(", ", parts);
-    }
-
-    private Set<Integer> parseAllowedDays(String daysCsv) {
-        String normalized = normalizeAutoRunDaysCsv(daysCsv);
-        if (normalized == null) {
-            return Set.of(1, 2, 3, 4, 5, 6, 7);
-        }
-        LinkedHashSet<Integer> days = new LinkedHashSet<>();
-        for (String token : normalized.split(",")) {
-            switch (token) {
-                case "MON" -> days.add(1);
-                case "TUE" -> days.add(2);
-                case "WED" -> days.add(3);
-                case "THU" -> days.add(4);
-                case "FRI" -> days.add(5);
-                case "SAT" -> days.add(6);
-                case "SUN" -> days.add(7);
-                default -> {
-                }
-            }
-        }
-        return days.isEmpty() ? Set.of(1, 2, 3, 4, 5, 6, 7) : days;
-    }
-
-    private void applyAutoRunDaysToUi(String daysCsv) {
-        Set<Integer> allowedDays = parseAllowedDays(daysCsv);
-        for (int i = 0; i < autoRunDayChecks.size(); i++) {
-            int dayValue = i + 1;
-            autoRunDayChecks.get(i).setSelected(allowedDays.contains(dayValue));
         }
     }
 
@@ -2552,23 +1970,13 @@ public final class DownloaderFxApp extends Application {
         return result;
     }
 
-    private void shutdownAutoRunScheduler() {
-        ScheduledExecutorService scheduler = autoRunScheduler;
-        autoRunScheduler = null;
-        nextAutoRunAt = null;
-        if (scheduler != null) {
-            scheduler.shutdownNow();
-        }
-    }
-
     private void exitApplication() {
         if (systemTraySupport != null) {
             systemTraySupport.dispose();
             systemTraySupport = null;
         }
-        if (activeMonitorTask != null) {
-            activeMonitorTask.cancel(true);
-            activeMonitorTask = null;
+        if (monitorScheduler != null) {
+            monitorScheduler.requestStop();
         }
         if (ownerStage != null) {
             ownerStage.hide();
@@ -2585,7 +1993,6 @@ public final class DownloaderFxApp extends Application {
                 systemTraySupport = null;
             }
             Utils.clearLogSink();
-            shutdownAutoRunScheduler();
             if (activeDownloadTask != null) {
                 Thread cleanup = new Thread(() -> {
                     try {
@@ -2816,9 +2223,9 @@ public final class DownloaderFxApp extends Application {
     private void loadSavedFolders() {
         try {
             folderItems.clear();
-            List<String> savedFolders = FolderSelectionStore.loadFolders();
-            for (String folder : savedFolders) {
-                folderItems.add(new FolderItem(folder));
+            List<FolderSelectionStore.FolderEntry> savedFolders = FolderSelectionStore.loadFolderEntries();
+            for (FolderSelectionStore.FolderEntry entry : savedFolders) {
+                folderItems.add(new FolderItem(entry.path(), entry.selected()));
             }
         } catch (Exception ex) {
             addDetailLog("Failed to load folder list: " + ex.getMessage());
@@ -2826,11 +2233,11 @@ public final class DownloaderFxApp extends Application {
     }
 
     private void saveFolderSelections() {
-        List<String> values = new ArrayList<>();
+        List<FolderSelectionStore.FolderEntry> entries = new ArrayList<>();
         for (FolderItem item : folderItems) {
-            values.add(item.path());
+            entries.add(new FolderSelectionStore.FolderEntry(item.path(), item.selectedProperty().get()));
         }
-        FolderSelectionStore.saveFolders(values);
+        FolderSelectionStore.saveFolderEntries(entries);
     }
 
     private List<Path> requireSelectedPaths() {
@@ -2871,6 +2278,33 @@ public final class DownloaderFxApp extends Application {
         statusLabel.getStyleClass().add(styleClass);
     }
 
+    private void showToast(String text, boolean error) {
+        if (text == null || text.isBlank() || toastLabel == null) {
+            return;
+        }
+        Runnable show = () -> {
+            toastLabel.setText(text);
+            toastLabel.getStyleClass().removeAll("toast-success", "toast-error");
+            toastLabel.getStyleClass().add(error ? "toast-error" : "toast-success");
+            toastLabel.setVisible(true);
+            toastLabel.setManaged(true);
+            if (toastHideDelay != null) {
+                toastHideDelay.stop();
+            }
+            toastHideDelay = new PauseTransition(Duration.seconds(error ? 4 : 3));
+            toastHideDelay.setOnFinished(event -> {
+                toastLabel.setVisible(false);
+                toastLabel.setManaged(false);
+            });
+            toastHideDelay.playFromStart();
+        };
+        if (Platform.isFxApplicationThread()) {
+            show.run();
+        } else {
+            Platform.runLater(show);
+        }
+    }
+
     private void handleRuntimeLog(String line) {
         if (line == null || line.isBlank()) {
             return;
@@ -2900,13 +2334,24 @@ public final class DownloaderFxApp extends Application {
 
         String keyword = extractKeyword(line);
         String status = extractRuntimeStatus(line);
+        String runtimeMessage = extractRuntimeMessage(line);
+        if (keyword != null && status != null) {
+            currentActivityText = keyword + " [" + status + "]: "
+                + messageForDisplay(runtimeMessage, "Working");
+            String folderFromMessage = extractFolderFromMessage(runtimeMessage);
+            if (folderFromMessage != null) {
+                keywordFolderState.put(keyword, folderFromMessage);
+            }
+            updateAgentFileFromLog(keyword, runtimeMessage);
+            updateBbmtFileFromLog(keyword, runtimeMessage);
+        }
         if (keyword != null && "START".equals(status)) {
             moveKeywordToTop(keyword);
             keywordResultState.put(keyword, "RUNNING");
             keywordDownloadState.putIfAbsent(keyword, "-");
             keywordStartTimeState.put(keyword, extractRuntimeTime(line));
             keywordEndTimeState.put(keyword, "-");
-            keywordMessageState.put(keyword, messageForDisplay(extractRuntimeMessage(line), "Started"));
+            keywordMessageState.put(keyword, messageForDisplay(runtimeMessage, "Started"));
             failedKeywordSet.remove(keyword);
         }
 
@@ -2927,18 +2372,22 @@ public final class DownloaderFxApp extends Application {
             if (keyword != null) {
                 keywordResultState.put(keyword, "SUCCESS");
                 keywordEndTimeState.put(keyword, extractRuntimeTime(line));
-                keywordMessageState.put(keyword, messageForDisplay(extractRuntimeMessage(line), "Completed"));
+                keywordMessageState.put(keyword, messageForDisplay(runtimeMessage, "Completed"));
                 failedKeywordSet.remove(keyword);
             }
             return;
         }
 
         if (keyword != null && line.contains("Downloaded files:")) {
-            Matcher matcher = DOWNLOADED_FILES_PATTERN.matcher(line);
-            if (matcher.find()) {
-                int downloaded = Integer.parseInt(matcher.group(1));
-                int expected = Integer.parseInt(matcher.group(2));
-                keywordDownloadState.put(keyword, downloaded + "/" + expected);
+            if (keywordAgentFilesState.containsKey(keyword)) {
+                updateAgentFileProgress(keyword);
+            } else {
+                Matcher matcher = DOWNLOADED_FILES_PATTERN.matcher(line);
+                if (matcher.find()) {
+                    int downloaded = Integer.parseInt(matcher.group(1));
+                    int expected = Integer.parseInt(matcher.group(2));
+                    keywordDownloadState.put(keyword, downloaded + "/" + expected);
+                }
             }
         }
 
@@ -2957,19 +2406,231 @@ public final class DownloaderFxApp extends Application {
         if (keyword != null && "STOP".equals(status)) {
             keywordResultState.put(keyword, "STOPPED");
             keywordEndTimeState.put(keyword, extractRuntimeTime(line));
-            keywordMessageState.put(keyword, messageForDisplay(extractRuntimeMessage(line), "Stopped"));
+            keywordMessageState.put(keyword, messageForDisplay(runtimeMessage, "Stopped"));
         }
 
         if (keyword != null && !line.isBlank()) {
-            keywordMessageState.put(keyword, messageForDisplay(extractRuntimeMessage(line), keywordMessageState.get(keyword)));
+            keywordMessageState.put(keyword, messageForDisplay(runtimeMessage, keywordMessageState.get(keyword)));
         }
+    }
+
+    private void updateAgentFileFromLog(String keyword, String message) {
+        if (keyword == null || keyword.isBlank() || message == null || !message.startsWith("Agent ")) {
+            return;
+        }
+        String status = agentStatusFromMessage(message);
+        if (status == null) {
+            return;
+        }
+        Map<String, String> fields = agentFields(message);
+        String fileName = valueOrDash(fields.get("file"));
+        String fileId = valueOrDash(fields.get("fileId"));
+        String folder = valueOrDash(fields.get("folder"));
+        String key = !"-".equals(fileId) ? fileId : fileName;
+        if (key == null || key.isBlank() || "-".equals(key)) {
+            key = message;
+        }
+
+        LinkedHashMap<String, AgentFileProgressState> files = keywordAgentFilesState.computeIfAbsent(
+            keyword,
+            ignored -> new LinkedHashMap<>()
+        );
+        AgentFileProgressState previous = files.get(key);
+        String effectiveFileName = "-".equals(fileName) && previous != null ? previous.fileName : fileName;
+        String effectiveFileId = "-".equals(fileId) && previous != null ? previous.fileId : fileId;
+        String effectiveFolder = "-".equals(folder) && previous != null ? previous.folder : folder;
+        files.put(key, new AgentFileProgressState(
+            effectiveFileName,
+            effectiveFileId,
+            status,
+            agentMessageForDisplay(message),
+            effectiveFolder,
+            LocalTime.now().format(PROGRESS_TIME_FORMAT)
+        ));
+        currentAgentKeyword = keyword;
+        updateAgentFileProgress(keyword);
+    }
+
+    private String agentStatusFromMessage(String message) {
+        if (message.startsWith("Agent file found:")) {
+            return "QUEUED";
+        }
+        if (message.startsWith("Agent downloading:")) {
+            return "DOWNLOADING";
+        }
+        if (message.startsWith("Agent downloaded:")) {
+            return "DOWNLOADED";
+        }
+        if (message.startsWith("Agent skipped existing:")) {
+            return "SKIPPED_EXISTS";
+        }
+        if (message.startsWith("Agent skipped invalid ref:")) {
+            return "FAILED";
+        }
+        if (message.startsWith("Agent unavailable:")) {
+            return "AGENT_UNAVAILABLE";
+        }
+        if (message.startsWith("Agent failed 403:")) {
+            return "FORBIDDEN";
+        }
+        if (message.startsWith("Agent failed:")) {
+            return "FAILED";
+        }
+        return null;
+    }
+
+    private Map<String, String> agentFields(String message) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        Matcher matcher = AGENT_FILE_FIELD_PATTERN.matcher(message == null ? "" : message);
+        while (matcher.find()) {
+            fields.put(matcher.group(1), matcher.group(2).trim());
+        }
+        return fields;
+    }
+
+    private String agentMessageForDisplay(String message) {
+        if (message == null || message.isBlank()) {
+            return "-";
+        }
+        String[] parts = message.split("\\|");
+        for (String part : parts) {
+            String trimmed = part.trim();
+            if (!trimmed.startsWith("file=")
+                && !trimmed.startsWith("fileId=")
+                && !trimmed.startsWith("folder=")
+                && !trimmed.startsWith("Downloaded files:")
+                && !trimmed.startsWith("completed=")) {
+                return trimmed;
+            }
+        }
+        return message;
+    }
+
+    private void updateAgentFileProgress(String keyword) {
+        LinkedHashMap<String, AgentFileProgressState> files = keywordAgentFilesState.get(keyword);
+        if (files == null || files.isEmpty()) {
+            return;
+        }
+        int downloaded = 0;
+        for (AgentFileProgressState file : files.values()) {
+            if ("DOWNLOADED".equals(file.status) || "SKIPPED_EXISTS".equals(file.status)) {
+                downloaded++;
+            }
+        }
+        keywordDownloadState.put(keyword, downloaded + "/" + files.size());
+    }
+
+    private int countUnfinishedAgentFiles() {
+        int unfinished = 0;
+        for (LinkedHashMap<String, AgentFileProgressState> files : keywordAgentFilesState.values()) {
+            if (files == null) {
+                continue;
+            }
+            for (AgentFileProgressState file : files.values()) {
+                if (!isAgentFileDone(file)) {
+                    unfinished++;
+                }
+            }
+        }
+        return unfinished;
+    }
+
+    private boolean isAgentFileDone(AgentFileProgressState file) {
+        return file != null
+            && ("DOWNLOADED".equals(file.status) || "SKIPPED_EXISTS".equals(file.status));
+    }
+
+    private void updateBbmtFileFromLog(String keyword, String message) {
+        if (keyword == null || keyword.isBlank() || message == null || message.isBlank()) {
+            return;
+        }
+        if (message.startsWith("BBMT PDF saved:")) {
+            String fileName = message.substring("BBMT PDF saved:".length()).split("\\|", 2)[0].trim();
+            upsertBbmtFile(keyword, valueOrDash(fileName), "DOWNLOADED", message);
+            return;
+        }
+        if (message.contains("BBMT already on disk:")) {
+            String fileName = message.substring(message.indexOf("BBMT already on disk:") + "BBMT already on disk:".length()).trim();
+            upsertBbmtFile(keyword, valueOrDash(fileName), "SKIPPED_EXISTS", message);
+            return;
+        }
+        if (message.contains("BBMT tab not present")) {
+            markExistingBbmtFile(keyword, "FAILED", message);
+        }
+    }
+
+    private void upsertBbmtFile(String keyword, String fileName, String status, String message) {
+        LinkedHashMap<String, AgentFileProgressState> files = keywordAgentFilesState.computeIfAbsent(
+            keyword,
+            ignored -> new LinkedHashMap<>()
+        );
+        String key = firstBbmtFileKey(files);
+        AgentFileProgressState previous = key == null ? null : files.get(key);
+        String effectiveKey = key == null ? "BBMT:" + fileName : key;
+        files.put(effectiveKey, new AgentFileProgressState(
+            valueOrDash(fileName),
+            previous == null ? "-" : previous.fileId,
+            status,
+            message,
+            previous == null ? "-" : previous.folder,
+            LocalTime.now().format(PROGRESS_TIME_FORMAT)
+        ));
+        currentAgentKeyword = keyword;
+        updateAgentFileProgress(keyword);
+    }
+
+    private void markExistingBbmtFile(String keyword, String status, String message) {
+        LinkedHashMap<String, AgentFileProgressState> files = keywordAgentFilesState.get(keyword);
+        String key = firstBbmtFileKey(files);
+        if (key == null || files == null) {
+            return;
+        }
+        AgentFileProgressState previous = files.get(key);
+        files.put(key, new AgentFileProgressState(
+            previous.fileName,
+            previous.fileId,
+            status,
+            message,
+            previous.folder,
+            LocalTime.now().format(PROGRESS_TIME_FORMAT)
+        ));
+        currentAgentKeyword = keyword;
+        updateAgentFileProgress(keyword);
+    }
+
+    private String firstBbmtFileKey(LinkedHashMap<String, AgentFileProgressState> files) {
+        if (files == null || files.isEmpty()) {
+            return null;
+        }
+        for (Map.Entry<String, AgentFileProgressState> entry : files.entrySet()) {
+            AgentFileProgressState file = entry.getValue();
+            if (file != null && looksLikeBbmtName(file.fileName)) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
+    private boolean looksLikeBbmtName(String fileName) {
+        if (fileName == null || fileName.isBlank()) {
+            return false;
+        }
+        String lower = fileName.toLowerCase();
+        String folded = java.text.Normalizer.normalize(lower, java.text.Normalizer.Form.NFD).replaceAll("\\p{M}+", "");
+        return folded.contains("bbmt")
+            || folded.contains("bien ban")
+            || folded.contains("mo thau")
+            || folded.contains("contractor_list");
     }
 
     private void refreshProgressView() {
         loadedLabel.setText("Loaded: " + loadedKeywords);
+        runningLabel.setText("Running: " + countRowsWithStatus("RUNNING"));
+        downloadedFilesLabel.setText("Files: " + totalDownloadedFilesText());
         successLabel.setText("Success: " + successCount);
         failCount = failedKeywordSet.size();
         failedLabel.setText("Failed: " + failCount);
+        currentActivityLabel.setText("Now: " + currentActivityText);
         List<KeywordProgressRow> rows = buildKeywordProgressRows();
         List<String> mainSelectedKeywords = selectedKeywords(progressTableView);
         int mainSelectedIndex = progressTableView == null ? -1 : progressTableView.getSelectionModel().getSelectedIndex();
@@ -2980,6 +2641,8 @@ public final class DownloaderFxApp extends Application {
 
         restoreProgressSelection(progressTableView, mainSelectedKeywords, mainSelectedIndex);
         restoreProgressSelection(detailProgressTableView, detailSelectedKeywords, detailSelectedIndex);
+        refreshAgentFileDetail();
+        refreshDetailAgentFileDetail();
     }
 
     private void clearRunData() {
@@ -2994,6 +2657,12 @@ public final class DownloaderFxApp extends Application {
         keywordMessageState.clear();
         keywordStartTimeState.clear();
         keywordEndTimeState.clear();
+        keywordAgentFilesState.clear();
+        agentFileRows.clear();
+        detailAgentFileRows.clear();
+        selectedAgentKeyword = null;
+        currentAgentKeyword = null;
+        currentActivityText = "Idle";
         resetProgressCounters();
         viewLogButton.setDisable(false);
     }
@@ -3038,23 +2707,118 @@ public final class DownloaderFxApp extends Application {
         return Path.of("logs", "app-" + LocalDate.now() + ".log").toAbsolutePath().normalize();
     }
 
+    private void setProgressZoomPercent(int requestedPercent) {
+        progressZoomPercent = Math.max(100, Math.min(150, requestedPercent));
+        if (detailProgressZoomLabel != null) {
+            detailProgressZoomLabel.setText(progressZoomPercent + "%");
+        }
+        if (detailProgressRoot != null) {
+            detailProgressRoot.getStyleClass().removeAll(
+                "progress-zoom-100",
+                "progress-zoom-125",
+                "progress-zoom-150"
+            );
+            detailProgressRoot.getStyleClass().add("progress-zoom-" + progressZoomPercent);
+        }
+        double rowHeight = switch (progressZoomPercent) {
+            case 150 -> 48;
+            case 125 -> 42;
+            default -> 34;
+        };
+        if (detailProgressTableView != null) {
+            detailProgressTableView.setFixedCellSize(rowHeight);
+        }
+        if (detailAgentFileTableView != null) {
+            detailAgentFileTableView.setFixedCellSize(rowHeight);
+        }
+    }
+
     private void showProgressFullscreen() {
+        if (detailProgressStage != null && detailProgressStage.isShowing()) {
+            detailProgressStage.toFront();
+            detailProgressStage.requestFocus();
+            return;
+        }
         TableView<KeywordProgressRow> detailTableView = createProgressTable(true);
         detailProgressTableView = detailTableView;
+        detailAgentFileTableView = createAgentFileTable(detailAgentFileRows);
+        TableView<AgentFileProgressRow> detailFileTableView = detailAgentFileTableView;
+        detailFileTableView.setPrefHeight(240);
+        detailFileTableView.setMinHeight(180);
 
-        VBox content = new VBox(10, detailTableView);
+        detailTableView.getSelectionModel().selectedItemProperty().addListener((obs, oldRow, newRow) -> {
+            selectedAgentKeyword = newRow == null ? null : newRow.keyword();
+            if (selectedAgentKeyword != null && !selectedAgentKeyword.isBlank()) {
+                selectKeywordInTable(progressTableView, selectedAgentKeyword);
+            }
+            refreshAgentFileDetail();
+            refreshDetailAgentFileDetail();
+        });
+
+        detailAgentFileTitleLabel = new Label("Files: select a keyword");
+        detailAgentFileTitleLabel.getStyleClass().add("section-title-small");
+        detailAgentFileFolderLabel = new Label("Folder: -");
+        detailAgentFileFolderLabel.getStyleClass().add("field-hint");
+        VBox detailAgentFilePanel = buildAgentFilePanel(
+            detailAgentFileTitleLabel,
+            detailAgentFileFolderLabel,
+            detailFileTableView,
+            true
+        );
+
+        Button zoomOutButton = new Button("-");
+        zoomOutButton.getStyleClass().add("secondary-button");
+        Button zoomInButton = new Button("+");
+        zoomInButton.getStyleClass().add("secondary-button");
+        Button resetZoomButton = new Button("Reset");
+        resetZoomButton.getStyleClass().add("secondary-button");
+        detailProgressZoomLabel = new Label();
+        detailProgressZoomLabel.getStyleClass().add("field-hint");
+
+        zoomOutButton.setOnAction(event -> setProgressZoomPercent(progressZoomPercent - 25));
+        zoomInButton.setOnAction(event -> setProgressZoomPercent(progressZoomPercent + 25));
+        resetZoomButton.setOnAction(event -> setProgressZoomPercent(125));
+
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        HBox toolbar = new HBox(8, new Label("Zoom"), zoomOutButton, detailProgressZoomLabel, zoomInButton, resetZoomButton, spacer);
+        toolbar.setAlignment(Pos.CENTER_LEFT);
+
+        SplitPane detailSplit = new SplitPane(detailTableView, detailAgentFilePanel);
+        detailSplit.setOrientation(javafx.geometry.Orientation.VERTICAL);
+        detailSplit.setDividerPositions(0.67);
+
+        VBox content = new VBox(10, toolbar, detailSplit);
+        content.getStyleClass().add("progress-zoom-root");
         content.setPadding(new Insets(12));
         VBox.setVgrow(detailTableView, Priority.ALWAYS);
+        VBox.setVgrow(detailSplit, Priority.ALWAYS);
+        detailProgressRoot = content;
+        setProgressZoomPercent(progressZoomPercent);
+        restoreProgressSelection(detailTableView, selectedKeywords(progressTableView), progressTableView.getSelectionModel().getSelectedIndex());
+        refreshDetailAgentFileDetail();
 
-        Scene detailScene = new Scene(content, 980, 680);
+        Scene detailScene = new Scene(content, 1180, 760);
         Stage detailStage = new Stage();
         detailStage.initOwner(ownerStage);
-        detailStage.initModality(Modality.WINDOW_MODAL);
-        detailStage.setTitle("Progress details");
+        detailStage.setTitle("Progress zoom");
         detailStage.setScene(detailScene);
+        detailStage.setResizable(true);
+        detailProgressStage = detailStage;
         detailStage.setOnHidden(event -> {
             if (detailProgressTableView == detailTableView) {
                 detailProgressTableView = null;
+            }
+            if (detailAgentFileTableView == detailFileTableView) {
+                detailAgentFileTableView = null;
+                detailAgentFileRows.clear();
+            }
+            detailAgentFileTitleLabel = null;
+            detailAgentFileFolderLabel = null;
+            detailProgressZoomLabel = null;
+            detailProgressRoot = null;
+            if (detailProgressStage == detailStage) {
+                detailProgressStage = null;
             }
         });
         detailStage.show();
@@ -3154,7 +2918,7 @@ public final class DownloaderFxApp extends Application {
             }
         });
 
-        TableColumn<KeywordProgressRow, String> progressCol = new TableColumn<>("Progress");
+        TableColumn<KeywordProgressRow, String> progressCol = new TableColumn<>("Files");
         progressCol.setCellValueFactory(cell -> cell.getValue().downloadedProperty());
         progressCol.setMinWidth(110);
 
@@ -3176,6 +2940,114 @@ public final class DownloaderFxApp extends Application {
             : TableView.CONSTRAINED_RESIZE_POLICY_FLEX_LAST_COLUMN);
         attachProgressCopyMenu(tableView);
         return tableView;
+    }
+
+    private TableView<AgentFileProgressRow> createAgentFileTable(ObservableList<AgentFileProgressRow> rows) {
+        TableView<AgentFileProgressRow> tableView = new TableView<>(rows);
+        tableView.getStyleClass().add("agent-file-table-view");
+        tableView.setPlaceholder(new Label("No files detected for this keyword yet."));
+        tableView.setPrefHeight(165);
+        tableView.setMinHeight(130);
+
+        TableColumn<AgentFileProgressRow, String> fileCol = new TableColumn<>("File");
+        fileCol.setCellValueFactory(cell -> cell.getValue().fileNameProperty());
+        fileCol.setMinWidth(260);
+
+        TableColumn<AgentFileProgressRow, String> statusCol = new TableColumn<>("Status");
+        statusCol.setCellValueFactory(cell -> cell.getValue().statusProperty());
+        statusCol.setMinWidth(135);
+        statusCol.setCellFactory(column -> new TableCell<>() {
+            @Override
+            protected void updateItem(String item, boolean empty) {
+                super.updateItem(item, empty);
+                if (empty || item == null) {
+                    setText(null);
+                    setStyle("");
+                    return;
+                }
+                setText(item);
+                setStyle("-fx-text-fill: " + agentStatusColorHex(item) + "; -fx-font-weight: 700;");
+            }
+        });
+
+        TableColumn<AgentFileProgressRow, String> messageCol = new TableColumn<>("Message");
+        messageCol.setCellValueFactory(cell -> cell.getValue().messageProperty());
+        messageCol.setMinWidth(230);
+
+        TableColumn<AgentFileProgressRow, String> fileIdCol = new TableColumn<>("File ID");
+        fileIdCol.setCellValueFactory(cell -> cell.getValue().fileIdProperty());
+        fileIdCol.setMinWidth(180);
+
+        TableColumn<AgentFileProgressRow, String> updatedCol = new TableColumn<>("Updated");
+        updatedCol.setCellValueFactory(cell -> cell.getValue().updatedAtProperty());
+        updatedCol.setMinWidth(90);
+
+        tableView.getColumns().setAll(fileCol, statusCol, messageCol, fileIdCol, updatedCol);
+        tableView.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_FLEX_LAST_COLUMN);
+        return tableView;
+    }
+
+    private void refreshAgentFileDetail() {
+        refreshAgentFileDetail(agentFileRows, agentFileTitleLabel, agentFileFolderLabel);
+    }
+
+    private void refreshDetailAgentFileDetail() {
+        if (detailAgentFileTableView == null) {
+            return;
+        }
+        refreshAgentFileDetail(detailAgentFileRows, detailAgentFileTitleLabel, detailAgentFileFolderLabel);
+    }
+
+    private void refreshAgentFileDetail(
+        ObservableList<AgentFileProgressRow> rowsTarget,
+        Label titleLabel,
+        Label folderLabel
+    ) {
+        String keyword = selectedAgentKeyword != null && !selectedAgentKeyword.isBlank()
+            ? selectedAgentKeyword
+            : currentAgentKeyword;
+        if (titleLabel != null) {
+            titleLabel.setText(keyword == null || keyword.isBlank() ? "Files: select a keyword" : "Files: " + keyword);
+        }
+        if (folderLabel != null) {
+            String folder = keyword == null ? null : keywordFolderState.get(keyword);
+            String downloadFolder = agentDownloadFolder(keyword);
+            folderLabel.setText("Folder: " + valueOrDash(folder) + " | Download: " + valueOrDash(downloadFolder));
+        }
+        if (keyword == null || keyword.isBlank()) {
+            rowsTarget.clear();
+            return;
+        }
+        LinkedHashMap<String, AgentFileProgressState> files = keywordAgentFilesState.get(keyword);
+        if (files == null || files.isEmpty()) {
+            rowsTarget.clear();
+            return;
+        }
+        List<AgentFileProgressRow> rows = new ArrayList<>();
+        for (AgentFileProgressState file : files.values()) {
+            rows.add(new AgentFileProgressRow(
+                valueOrDash(file.fileName),
+                valueOrDash(file.fileId),
+                valueOrDash(file.status),
+                valueOrDash(file.message),
+                valueOrDash(file.folder),
+                valueOrDash(file.updatedAt)
+            ));
+        }
+        rowsTarget.setAll(rows);
+    }
+
+    private String agentDownloadFolder(String keyword) {
+        LinkedHashMap<String, AgentFileProgressState> files = keyword == null ? null : keywordAgentFilesState.get(keyword);
+        if (files == null || files.isEmpty()) {
+            return null;
+        }
+        for (AgentFileProgressState file : files.values()) {
+            if (file != null && file.folder != null && !file.folder.isBlank() && !"-".equals(file.folder)) {
+                return file.folder;
+            }
+        }
+        return null;
     }
 
     private void attachProgressCopyMenu(TableView<KeywordProgressRow> tableView) {
@@ -3245,6 +3117,24 @@ public final class DownloaderFxApp extends Application {
         }
     }
 
+    private void selectKeywordInTable(TableView<KeywordProgressRow> tableView, String keyword) {
+        if (tableView == null || keyword == null || keyword.isBlank()) {
+            return;
+        }
+        KeywordProgressRow selected = tableView.getSelectionModel().getSelectedItem();
+        if (selected != null && keyword.equals(selected.keyword())) {
+            return;
+        }
+        for (int i = 0; i < progressRows.size(); i++) {
+            KeywordProgressRow row = progressRows.get(i);
+            if (row != null && keyword.equals(row.keyword())) {
+                tableView.getSelectionModel().clearAndSelect(i);
+                tableView.scrollTo(i);
+                return;
+            }
+        }
+    }
+
     private String formatProgressRowForCopy(KeywordProgressRow row) {
         if (row == null) {
             return "";
@@ -3307,6 +3197,11 @@ public final class DownloaderFxApp extends Application {
         return matcher.find() ? matcher.group(3) : "";
     }
 
+    private String extractFolderFromMessage(String message) {
+        Matcher matcher = FOLDER_IN_MESSAGE_PATTERN.matcher(message == null ? "" : message);
+        return matcher.find() ? matcher.group(1).trim() : null;
+    }
+
     private String messageForDisplay(String candidate, String fallback) {
         if (candidate != null && !candidate.isBlank()) {
             return candidate.trim();
@@ -3315,6 +3210,36 @@ public final class DownloaderFxApp extends Application {
             return fallback;
         }
         return "-";
+    }
+
+    private String valueOrDash(String value) {
+        return value == null || value.isBlank() ? "-" : value;
+    }
+
+    private int countRowsWithStatus(String status) {
+        int count = 0;
+        for (String value : keywordResultState.values()) {
+            if (status.equals(value)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private String totalDownloadedFilesText() {
+        int downloaded = 0;
+        int expected = 0;
+        boolean hasExpected = false;
+        for (String value : keywordDownloadState.values()) {
+            Matcher matcher = DOWNLOADED_FILES_PATTERN.matcher("Downloaded files: " + value);
+            if (!matcher.find()) {
+                continue;
+            }
+            downloaded += Integer.parseInt(matcher.group(1));
+            expected += Integer.parseInt(matcher.group(2));
+            hasExpected = true;
+        }
+        return hasExpected ? downloaded + "/" + expected : "0/0";
     }
 
     private record KeywordProgressRow(
@@ -3356,6 +3281,45 @@ public final class DownloaderFxApp extends Application {
         }
     }
 
+    private record AgentFileProgressState(
+        String fileName,
+        String fileId,
+        String status,
+        String message,
+        String folder,
+        String updatedAt
+    ) {
+    }
+
+    private record AgentFileProgressRow(
+        String fileName,
+        String fileId,
+        String status,
+        String message,
+        String folder,
+        String updatedAt
+    ) {
+        private javafx.beans.property.SimpleStringProperty fileNameProperty() {
+            return new javafx.beans.property.SimpleStringProperty(fileName);
+        }
+
+        private javafx.beans.property.SimpleStringProperty fileIdProperty() {
+            return new javafx.beans.property.SimpleStringProperty(fileId);
+        }
+
+        private javafx.beans.property.SimpleStringProperty statusProperty() {
+            return new javafx.beans.property.SimpleStringProperty(status);
+        }
+
+        private javafx.beans.property.SimpleStringProperty messageProperty() {
+            return new javafx.beans.property.SimpleStringProperty(message);
+        }
+
+        private javafx.beans.property.SimpleStringProperty updatedAtProperty() {
+            return new javafx.beans.property.SimpleStringProperty(updatedAt);
+        }
+    }
+
     private static Color statusColor(String status) {
         return switch (status == null ? "" : status) {
             case "RUNNING" -> Color.web("#2563eb");
@@ -3376,13 +3340,27 @@ public final class DownloaderFxApp extends Application {
         };
     }
 
+    private static String agentStatusColorHex(String status) {
+        return switch (status == null ? "" : status) {
+            case "DOWNLOADED", "SKIPPED_EXISTS" -> "#16a34a";
+            case "DOWNLOADING" -> "#2563eb";
+            case "QUEUED" -> "#6d28d9";
+            case "FORBIDDEN", "FAILED", "AGENT_UNAVAILABLE" -> "#dc2626";
+            default -> "#64748b";
+        };
+    }
+
     private static final class FolderItem {
         private final BooleanProperty selected = new SimpleBooleanProperty(false);
         private String path;
 
         private FolderItem(String path) {
+            this(path, true);
+        }
+
+        private FolderItem(String path, boolean selected) {
             this.path = path;
-            this.selected.set(true);
+            this.selected.set(selected);
         }
 
         private String path() {

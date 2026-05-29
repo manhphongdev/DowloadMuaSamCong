@@ -12,6 +12,7 @@ import vn.muasamcong.downloader.domain.bidpackage.PackageRepository;
 import vn.muasamcong.downloader.domain.bidpackage.PackageSyncStatus;
 import vn.muasamcong.downloader.model.KeywordTarget;
 import vn.muasamcong.downloader.parser.FolderKeywordReader;
+import vn.muasamcong.downloader.util.Utils;
 
 public final class PackageDiscoveryService {
 
@@ -71,6 +72,10 @@ public final class PackageDiscoveryService {
             ));
         }
         packageRepository.saveAll(discovered);
+        Utils.logPlain("Loaded keywords: " + discovered.size());
+        for (BidPackage pkg : discovered) {
+            Utils.logPlain("Loaded keyword: " + pkg.keyword() + " folder=" + pkg.folderPath());
+        }
         return new DiscoveryResult(discovered.size(), targets.size(), List.copyOf(discovered));
     }
 

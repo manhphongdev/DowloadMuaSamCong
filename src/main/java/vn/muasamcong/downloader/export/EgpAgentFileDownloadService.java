@@ -91,9 +91,14 @@ public final class EgpAgentFileDownloadService {
             return new Result(Outcome.SKIPPED_INVALID_REF, null, "missing fileId");
         }
         String fileName = safeFileName(ref.fileName(), ref.fileId());
-        Path dir = ref.subDir() == null ? outputDir : outputDir.resolve(ref.subDir());
+        Path outputRoot = outputDir.toAbsolutePath().normalize();
+        Path subDir = safeSubDir(ref.subDir());
+        if (subDir == null) {
+            return new Result(Outcome.FAILED, null, "unsafe target path");
+        }
+        Path dir = outputRoot.resolve(subDir).normalize();
         Path target = dir.resolve(fileName).normalize();
-        if (!target.startsWith(dir.toAbsolutePath().normalize())) {
+        if (!target.startsWith(outputRoot)) {
             return new Result(Outcome.FAILED, null, "unsafe target path");
         }
         if (artifactFileExists(target)) {
@@ -269,7 +274,10 @@ public final class EgpAgentFileDownloadService {
                 continue;
             }
             any = true;
-            Path dir = ref.subDir() == null ? outputDir : outputDir.resolve(ref.subDir());
+            Path dir = resolveOutputDir(outputDir, ref.subDir());
+            if (dir == null) {
+                return false;
+            }
             Path target = dir.resolve(safeFileName(ref.fileName(), ref.fileId()));
             if (!artifactFileExists(target)) {
                 return false;
@@ -286,7 +294,10 @@ public final class EgpAgentFileDownloadService {
             if (ref == null || isBlank(ref.fileId())) {
                 continue;
             }
-            Path dir = ref.subDir() == null ? outputDir : outputDir.resolve(ref.subDir());
+            Path dir = resolveOutputDir(outputDir, ref.subDir());
+            if (dir == null) {
+                return true;
+            }
             Path target = dir.resolve(safeFileName(ref.fileName(), ref.fileId()));
             if (!artifactFileExists(target)) {
                 return true;
@@ -407,6 +418,30 @@ public final class EgpAgentFileDownloadService {
     private static String safeFileName(String fileName, String fileId) {
         String name = fileName == null || fileName.isBlank() ? fileId + ".bin" : fileName.trim();
         return name.replaceAll("[\\\\/:*?\"<>|]", "_");
+    }
+
+    private static Path resolveOutputDir(Path outputDir, Path subDir) {
+        if (outputDir == null) {
+            return null;
+        }
+        Path root = outputDir.toAbsolutePath().normalize();
+        Path safeSubDir = safeSubDir(subDir);
+        if (safeSubDir == null) {
+            return null;
+        }
+        Path dir = root.resolve(safeSubDir).normalize();
+        return dir.startsWith(root) ? dir : null;
+    }
+
+    private static Path safeSubDir(Path subDir) {
+        if (subDir == null) {
+            return Path.of("");
+        }
+        Path path = subDir.normalize();
+        if (path.isAbsolute() || path.startsWith("..")) {
+            return null;
+        }
+        return path;
     }
 
     private static boolean isBlank(String value) {
