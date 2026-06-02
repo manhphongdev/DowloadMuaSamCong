@@ -1,1 +1,0 @@
-[{"pageSize":1,"pageNumber":0,"query":[{"index":"es-contractor-selection","keyWord":"IB2600077452","matchType":"exact","matchFields":["notifyNo","bidName"],"filters":[{"fieldName":"type","searchType":"in","fieldValues":["es-notify-contractor"]}]}]}]
